@@ -68,23 +68,46 @@ export class PivxClient {
       body: JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    // Refuse an implausibly large body before buffering it into memory,
-    // otherwise a hostile node has an easy out-of-memory. This checks the
-    // declared Content-Length only; a chunked response without one still
-    // buffers through res.json() and would need a streaming reader to cap.
-    const declared = Number(res.headers.get('content-length'));
-    if (Number.isFinite(declared) && declared > this.maxResponseBytes) {
-      throw new Error(`${method}: response too large (${declared} bytes)`);
-    }
+    // Read the body with a hard byte cap so a hostile node can't exhaust
+    // memory. Streaming means the cap holds even without a Content-Length.
+    const raw = await this.readCapped(res, method);
     let body: { result?: T; error?: { code: number; message: string } | null };
     try {
-      body = await res.json() as typeof body;
+      body = JSON.parse(raw) as typeof body;
     } catch {
       throw new Error(`${method}: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
     }
     if (body.error) throw new RpcError(body.error.code, body.error.message, method);
     if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
     return body.result as T;
+  }
+
+  /** Read a response body as text, aborting once it exceeds maxResponseBytes. */
+  private async readCapped(res: Response, method: string): Promise<string> {
+    const tooBig = () => new Error(`${method}: response exceeds ${this.maxResponseBytes} bytes`);
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > this.maxResponseBytes) throw tooBig();
+    if (!res.body) {
+      // No stream (some fetch implementations): fall back to buffered text.
+      const text = await res.text();
+      if (text.length > this.maxResponseBytes) throw tooBig();
+      return text;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let out = '';
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > this.maxResponseBytes) {
+        await reader.cancel();
+        throw tooBig();
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+    return out + decoder.decode();
   }
 
   // ── Blockchain ────────────────────────────────────────────────────────────

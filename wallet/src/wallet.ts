@@ -405,6 +405,7 @@ export class PivxWallet {
 
     let probe = this.lastProcessedBlock - 1;
     let lastCp = this.lastProcessedBlock;
+    let adopted = false;
     while (probe > 0) {
       const [cpHeight, cpTree] = this.shield.get_closest_checkpoint(probe, this.isTestnet) as [
         number,
@@ -417,10 +418,14 @@ export class PivxWallet {
       if (nodeRoot === null || cpRoot === nodeRoot) {
         this.commitmentTree = cpTree;
         this.lastProcessedBlock = cpHeight;
+        adopted = true;
         break;
       }
       probe = cpHeight - 1;
     }
+    // No bundled checkpoint matched the node: do not proceed on an unconfirmed
+    // tree. Surface it rather than silently "validating".
+    if (!adopted) throw new ScanDivergedError(this.lastProcessedBlock, localRoot(), node);
     this.startValidated = true;
   }
 
