@@ -1,4 +1,4 @@
-import type { PivxClient } from 'pivx-rpc';
+import { RpcError, type PivxClient } from 'pivx-rpc';
 import { loadShield, type ProvingOptions, type Shield } from './shield-bindings.js';
 import type {
   BuiltTransaction,
@@ -17,6 +17,36 @@ const COIN_TYPE = { mainnet: 119, testnet: 1 } as const;
 /** Heights at/after which a block must carry a sapling root. Below these,
  * the node legitimately has none. */
 const SAPLING_ACTIVATION = { mainnet: 2_700_000, testnet: 43_200 } as const;
+
+/** A note worth no more than its own input fee (sapling input 384 bytes ×
+ * 1000 sats/byte) never helps cover amount+fee, so it is never spent. */
+const DUST_NOTE_SATS = 384_000;
+
+/**
+ * Mirror of the Rust/WASM note selection and fee model: consume notes
+ * smallest-first, growing the fee per sapling input, and report whether the
+ * inputs cover amount + fee. Used to refuse a send that would otherwise have
+ * the fee silently taken from the recipient.
+ */
+function estimateShieldSelection(
+  notes: SpendableNote[],
+  amount: number,
+  toIsShield: boolean,
+): { fee: number; sufficient: boolean } {
+  const tOut = toIsShield ? 0 : 1;
+  const feeFor = (sIn: number) => 1000 * (2 * 948 + sIn * 384 + tOut * 34 + 85);
+  const sorted = [...notes].sort((a, b) => a.note.value - b.note.value);
+  let total = 0;
+  let sIn = 0;
+  let fee = feeFor(0);
+  for (const n of sorted) {
+    sIn++;
+    fee = feeFor(sIn);
+    total += n.note.value;
+    if (total >= amount + fee) break;
+  }
+  return { fee, sufficient: total >= amount + fee };
+}
 
 /** Thrown when a watch-only wallet is asked to spend. */
 export class NoSpendAuthorityError extends Error {
@@ -184,12 +214,9 @@ export class PivxWallet {
       .reduce((sum, n) => sum + assertSats(n.note.value), 0);
   }
 
-  /** Sum of notes available to spend right now (excludes pending spends). */
-  private spendableTotal(): number {
-    const pending = new Set([...this.pendingSpends.values()].flat());
-    return this.notes
-      .filter((n) => !pending.has(n.nullifier))
-      .reduce((sum, n) => sum + assertSats(n.note.value), 0);
+  /** Whether `address` is a shield (Sapling) address on this wallet's network. */
+  private isShieldAddress(address: string): boolean {
+    return address.startsWith(this.isTestnet ? 'ptestsapling1' : 'ps1');
   }
 
   /** Currently tracked unspent notes. */
@@ -484,32 +511,54 @@ export class PivxWallet {
     if (opts.memo !== undefined && Buffer.byteLength(opts.memo, 'utf8') > 512) {
       throw new Error('memo must be at most 512 bytes');
     }
-    if (!(await this.shield.prover_is_loaded())) {
-      throw new Error('sapling prover not loaded: call loadProver() first');
-    }
     const useShield = opts.inputs === undefined || opts.inputs === 'shield';
     if (!useShield && !opts.transparentChangeAddress) {
       throw new Error('transparentChangeAddress is required when spending transparent inputs');
     }
-    // Send-max footgun: when the amount consumes the whole spendable balance
-    // the underlying library silently pays the fee out of the RECIPIENT's
-    // amount. Refuse unless the caller opts into sweep semantics. (Amounts
-    // within one fee of the balance can still trip this inside the WASM; see
-    // docs/usage.md — leave fee headroom for exact payouts.)
-    if (useShield && !opts.sweep && opts.amount >= this.spendableTotal()) {
-      throw new Error(
-        'amount consumes the entire spendable balance; leave headroom for the fee ' +
-          'or pass sweep:true to deduct the fee from the recipient',
-      );
+    // Validate transparent inputs. Amounts are satoshis here; a caller wiring
+    // pivx-rpc's PIV-float listUnspent straight in (a natural mistake) would
+    // otherwise donate the difference to fees.
+    if (!useShield) {
+      for (const u of opts.inputs as TransparentInput[]) {
+        if (!Number.isSafeInteger(u.amount) || u.amount < 0) {
+          throw new Error('transparent input amount must be a non-negative integer (satoshis)');
+        }
+      }
+    }
+
+    // Spendable notes, minus pending spends and dust. Dust notes (worth no
+    // more than their own input fee) can never help cover amount+fee and only
+    // let an attacker inflate the fee, so they are excluded from spending.
+    const pending = new Set([...this.pendingSpends.values()].flat());
+    const spendable = this.notes.filter(
+      (n) => !pending.has(n.nullifier) && n.note.value > DUST_NOTE_SATS,
+    );
+
+    if (useShield) {
+      // Refuse a send that the inputs can't cover including the fee, unless
+      // the caller opts into sweep. This mirrors the Rust selection so the
+      // WASM can't silently pay the fee out of the recipient's amount.
+      const { sufficient } = estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to));
+      if (!sufficient && !opts.sweep) {
+        throw new Error(
+          'insufficient spendable balance to cover amount + fee; lower the amount, ' +
+            'consolidate notes, or pass sweep:true to deduct the fee from the recipient',
+        );
+      }
+    }
+
+    // Prover is only needed to build; check it after the cheap validations
+    // so callers get input errors without loading ~50MB of parameters.
+    if (!(await this.shield.prover_is_loaded())) {
+      throw new Error('sapling prover not loaded: call loadProver() first');
     }
     if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
     this.busy = true;
     try {
-      const pending = new Set([...this.pendingSpends.values()].flat());
       const changeAddress = useShield ? this.getNewAddress() : opts.transparentChangeAddress!;
 
       const result = (await this.shield.create_transaction({
-        notes: useShield ? this.notes.filter((n) => !pending.has(n.nullifier)) : null,
+        notes: useShield ? spendable : null,
         utxos: useShield ? null : (opts.inputs as TransparentInput[]),
         extsk: this.extsk,
         to_address: opts.to,
@@ -535,7 +584,13 @@ export class PivxWallet {
       this.finalizeTransaction(tx.txid);
       return txid;
     } catch (err) {
-      this.discardTransaction(tx.txid);
+      // Only release the notes when the node definitively rejected the
+      // transaction. On a transport/timeout error the node may have accepted
+      // it, so keep the spend pending — discarding here could let a retry (or
+      // an operator reacting to a false "failed") double-spend or double-pay.
+      // Recover per docs/deployment.md: wait for the txid to confirm or
+      // clearly disappear, then resume.
+      if (err instanceof RpcError) this.discardTransaction(tx.txid);
       throw err;
     }
   }
@@ -599,7 +654,18 @@ export class PivxWallet {
         throw new Error('wallet state contains a malformed note');
       }
     }
+    if (!Array.isArray(state.diversifierIndex) || state.diversifierIndex.length !== 11) {
+      throw new Error('wallet state has an invalid diversifier index');
+    }
     const shield = await loadShield(proving);
+    // Confirm the viewing key decodes for this network before trusting it to
+    // derive receive addresses (a tampered state could otherwise repoint
+    // deposits to an attacker's key).
+    try {
+      shield.generate_default_payment_address(state.extfvk, state.network === 'testnet');
+    } catch {
+      throw new Error('wallet state has an invalid viewing key for its network');
+    }
     const wallet = new PivxWallet(
       shield,
       state.network,
