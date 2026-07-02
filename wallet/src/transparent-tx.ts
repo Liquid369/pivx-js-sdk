@@ -50,11 +50,20 @@ class Writer {
   done(): Uint8Array { return Uint8Array.from(this.parts); }
 }
 
-/** scriptPubKey for a destination address (P2PKH/exchange, or P2SH). */
+/**
+ * scriptPubKey for a destination address (P2PKH, P2SH, or exchange).
+ *
+ * An exchange address is NOT a plain P2PKH: PIVX prefixes the P2PKH script
+ * with OP_EXCHANGEADDR (0xe0) — see GetScriptForDestination in
+ * src/script/standard.cpp. Emitting a plain P2PKH would send to the wrong script.
+ */
 export function scriptPubKeyForAddress(address: string): Uint8Array {
   const d = decodeAddress(address);
-  if (d.kind === 'p2pkh' || d.kind === 'exchange') {
+  if (d.kind === 'p2pkh') {
     return Uint8Array.from([0x76, 0xa9, 0x14, ...d.hash, 0x88, 0xac]);
+  }
+  if (d.kind === 'exchange') {
+    return Uint8Array.from([0xe0, 0x76, 0xa9, 0x14, ...d.hash, 0x88, 0xac]);
   }
   if (d.kind === 'p2sh') {
     return Uint8Array.from([0xa9, 0x14, ...d.hash, 0x87]);
