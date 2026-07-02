@@ -14,6 +14,10 @@ import type {
 /** PIVX BIP44 coin types. */
 const COIN_TYPE = { mainnet: 119, testnet: 1 } as const;
 
+/** Heights at/after which a block must carry a sapling root. Below these,
+ * the node legitimately has none. */
+const SAPLING_ACTIVATION = { mainnet: 2_700_000, testnet: 43_200 } as const;
+
 /** Thrown when a watch-only wallet is asked to spend. */
 export class NoSpendAuthorityError extends Error {
   constructor() {
@@ -274,8 +278,14 @@ export class PivxWallet {
   }
 
   /**
-   * Sync from the node up to its current tip, verifying the local tree
-   * against the node's `finalsaplingroot` each batch.
+   * Sync from the node up to its current tip.
+   *
+   * Each batch checks the locally-built tree against the node's own
+   * `finalsaplingroot`. That catches malformed or mis-ordered data from the
+   * node, but it is a self-consistency check, not chain authentication: the
+   * SDK does not validate proof-of-stake, so a dishonest node can still serve
+   * a self-consistent fabricated chain. Point this at a node you trust. See
+   * SECURITY.md.
    */
   async sync(client: PivxClient, opts: SyncOptions = {}): Promise<void> {
     if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
@@ -359,12 +369,19 @@ export class PivxWallet {
    */
   private async ensureValidCheckpoint(client: PivxClient): Promise<void> {
     if (this.startValidated) return;
+    const activation = SAPLING_ACTIVATION[this.network];
+    // Sapling root at height h. Above activation the node must report one;
+    // treating an omitted root as "no root" would let a node suppress this
+    // check or force an all-the-way rewind by simply withholding the field.
     const rootAt = async (h: number): Promise<string | null> => {
-      if (h <= 0) return null;
+      if (h < activation) return null;
       const block = (await client.getBlock(await client.getBlockHash(h), 1)) as {
         finalsaplingroot?: string;
       };
-      return block.finalsaplingroot ?? null;
+      if (!block.finalsaplingroot) {
+        throw new Error(`node omitted finalsaplingroot at height ${h} (past sapling activation)`);
+      }
+      return block.finalsaplingroot;
     };
     const localRoot = () => reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
 
@@ -373,7 +390,16 @@ export class PivxWallet {
       this.startValidated = true;
       return;
     }
-    if (this.notes.length > 0 || this.pendingSpends.size > 0) {
+    // A rewind is only appropriate for a fresh wallet still sitting on a
+    // bundled checkpoint. A wallet that has scanned forward (past a
+    // checkpoint, or holding notes) and no longer matches is diverged —
+    // rewinding would silently discard correct progress.
+    const [nearest] = this.shield.get_closest_checkpoint(this.lastProcessedBlock, this.isTestnet) as [
+      number,
+      string,
+    ];
+    const atCheckpoint = nearest === this.lastProcessedBlock;
+    if (this.notes.length > 0 || this.pendingSpends.size > 0 || !atCheckpoint) {
       throw new ScanDivergedError(this.lastProcessedBlock, localRoot(), node);
     }
 
