@@ -76,8 +76,13 @@ export interface BuiltTransaction {
 }
 
 export interface SyncOptions {
-  /** Blocks fetched per round-trip batch. Default 100. */
+  /** Blocks per root-check batch. Default 100. */
   batchSize?: number;
+  /**
+   * Max concurrent block fetches. Default 8. Keep well under the node's
+   * rpcworkqueue (default 16) — a full batch fired at once returns 500s.
+   */
+  rpcConcurrency?: number;
   onProgress?: (height: number, tip: number) => void;
 }
 

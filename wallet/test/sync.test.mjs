@@ -49,6 +49,8 @@ test('sync pulls blocks from RPC, finds the note, and verifies the sapling root'
   const node = await stubNode(makeHandlers(goodRoot));
   try {
     const wallet = await PivxWallet.create({ spendingKey: EXTSK, network: 'testnet', birthHeight: BIRTH });
+    wallet['lastProcessedBlock'] = BIRTH; // stub models a chain of just one block past BIRTH
+    wallet['startValidated'] = true; // synthetic stub chain: skip node checkpoint validation
     const client = new PivxClient({ port: node.port });
     const progress = [];
     await wallet.sync(client, { onProgress: (h, tip) => progress.push([h, tip]) });
@@ -65,6 +67,8 @@ test('sync fails loudly when the node sapling root diverges', async () => {
   const node = await stubNode(makeHandlers('00'.repeat(32)));
   try {
     const wallet = await PivxWallet.create({ spendingKey: EXTSK, network: 'testnet', birthHeight: BIRTH });
+    wallet['lastProcessedBlock'] = BIRTH;
+    wallet['startValidated'] = true; // synthetic stub chain: skip node checkpoint validation
     const client = new PivxClient({ port: node.port });
     await assert.rejects(wallet.sync(client), ScanDivergedError);
   } finally {

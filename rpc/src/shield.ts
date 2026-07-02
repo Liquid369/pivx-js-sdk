@@ -73,7 +73,7 @@ export class ShieldWatcher extends EventEmitter {
 
   /** One polling pass. Exposed for callers that want their own scheduling. */
   async poll(): Promise<void> {
-    if (this.polling) return; // ponytail: skip overlapping polls instead of queueing
+    if (this.polling) return; // skip overlapping polls rather than queueing them
     this.polling = true;
     try {
       const hash = await this.client.getBestBlockHash();

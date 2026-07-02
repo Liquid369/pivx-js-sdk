@@ -68,10 +68,10 @@ export class PivxClient {
       body: JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    // Refuse an implausibly large body before buffering it into memory: an
-    // untrusted node otherwise has an easy OOM. ponytail: checks the declared
-    // Content-Length only; a chunked response without one still buffers via
-    // res.json() — tighten with a streaming reader if that becomes a vector.
+    // Refuse an implausibly large body before buffering it into memory,
+    // otherwise a hostile node has an easy out-of-memory. This checks the
+    // declared Content-Length only; a chunked response without one still
+    // buffers through res.json() and would need a streaming reader to cap.
     const declared = Number(res.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > this.maxResponseBytes) {
       throw new Error(`${method}: response too large (${declared} bytes)`);

@@ -76,13 +76,14 @@ test('previewTransaction decrypts without mutating state', async () => {
     network: 'testnet',
     birthHeight: BIRTH,
   });
+  const syncedBefore = wallet.getLastSyncedBlock();
   const outputs = wallet.previewTransaction(TX_HEX);
   assert.equal(outputs.length, 1);
   assert.equal(outputs[0].recipient, SHIELD_ADDRESS);
   assert.equal(outputs[0].value, 1_000_000_000);
   // state untouched
   assert.equal(wallet.getBalance(), 0);
-  assert.equal(wallet.getLastSyncedBlock(), BIRTH);
+  assert.equal(wallet.getLastSyncedBlock(), syncedBefore);
 });
 
 test('save/load round-trip preserves state; spending key is excluded', async () => {

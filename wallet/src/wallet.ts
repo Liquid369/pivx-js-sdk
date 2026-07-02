@@ -46,6 +46,13 @@ const assertSats = (v: unknown): number => {
   return v as number;
 };
 
+// Only sapling-capable (version 3) transactions carry shield outputs. Feeding
+// anything else to the scanner is wasted work, and the parser rejects some
+// legacy transactions outright. PIVX sapling txs serialize with a 4-byte
+// little-endian version of 3, so the hex starts with "03". This assumes
+// version 3 is the only shielded version; revisit if that ever changes.
+const isSaplingTx = (hex: string): boolean => hex.startsWith('03');
+
 /**
  * Standalone PIVX wallet: owns keys, scans blocks, tracks shielded notes,
  * and builds fully-proved transactions locally. A node (via `pivx-rpc`) is
@@ -66,6 +73,8 @@ export class PivxWallet {
   private diversifierIndex: number[];
   /** One writer at a time: block state-mutating operations from racing. */
   private busy = false;
+  /** Whether the starting checkpoint has been confirmed against the node. */
+  private startValidated = false;
 
   private constructor(
     private readonly shield: Shield,
@@ -113,10 +122,14 @@ export class PivxWallet {
       ? (shield.generate_extended_full_viewing_key(extsk, isTestnet) as string)
       : opts.viewingKey!;
 
-    const [, checkpointTree] = shield.get_closest_checkpoint(opts.birthHeight, isTestnet) as [
-      number,
-      string,
-    ];
+    // Resume from the checkpoint's own height, not birthHeight: the loaded
+    // tree is the committed state AT the checkpoint, so scanning must start
+    // at checkpointHeight + 1. Starting higher would leave the tree missing
+    // every shield output in the gap and diverge on the first real block.
+    const [checkpointHeight, checkpointTree] = shield.get_closest_checkpoint(
+      opts.birthHeight,
+      isTestnet,
+    ) as [number, string];
     const { diversifier_index } = shield.generate_default_payment_address(extfvk, isTestnet) as {
       address: string;
       diversifier_index: number[];
@@ -127,7 +140,7 @@ export class PivxWallet {
       network,
       extfvk,
       checkpointTree,
-      opts.birthHeight,
+      checkpointHeight,
       diversifier_index,
       extsk,
     );
@@ -209,7 +222,7 @@ export class PivxWallet {
 
     const result = this.shield.handle_blocks(
       this.commitmentTree,
-      blocks.map((b) => ({ txs: b.txs.map((t) => t.hex) })),
+      blocks.map((b) => ({ txs: b.txs.map((t) => t.hex).filter(isSaplingTx) })),
       this.extfvk,
       this.isTestnet,
       this.notes,
@@ -245,6 +258,7 @@ export class PivxWallet {
    * confirmed notes returned by {@link getNotes} after {@link sync}.
    */
   previewTransaction(hex: string): { recipient: string; value: number; memo?: string | null }[] {
+    if (!isSaplingTx(hex)) return []; // non-sapling tx has no shield outputs (and would panic the scanner)
     const result = this.shield.handle_blocks(
       this.commitmentTree,
       [{ txs: [hex] }],
@@ -268,28 +282,35 @@ export class PivxWallet {
     this.busy = true;
     try {
       const batchSize = opts.batchSize ?? 100;
+      // getblock verbosity 2 is heavy. A default node has 4 RPC threads and a
+      // work queue of 16, so firing a whole batch at once gets 500s. Keep the
+      // concurrent fetches well under that.
+      const concurrency = Math.max(1, opts.rpcConcurrency ?? 8);
       const tip = await client.getBlockCount();
+      await this.ensureValidCheckpoint(client);
+      const fetchBlock = async (h: number) => {
+        const hash = await client.getBlockHash(h);
+        const block = (await client.getBlock(hash, 2)) as {
+          height: number;
+          finalsaplingroot?: string;
+          tx: { hex: string; txid: string }[];
+        };
+        // Trust the height we asked for, not the one the node echoes, and
+        // reject a mismatch outright — otherwise a lying node can
+        // fast-forward lastProcessedBlock past real deposits.
+        if (block.height !== h) {
+          throw new Error(`node returned block height ${block.height} for requested height ${h}`);
+        }
+        return block;
+      };
       while (this.lastProcessedBlock < tip) {
         const from = this.lastProcessedBlock + 1;
         const to = Math.min(from + batchSize - 1, tip);
         const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
-        const blocks = await Promise.all(
-          heights.map(async (h) => {
-            const hash = await client.getBlockHash(h);
-            const block = (await client.getBlock(hash, 2)) as {
-              height: number;
-              finalsaplingroot?: string;
-              tx: { hex: string; txid: string }[];
-            };
-            // Trust the height we asked for, not the one the node echoes,
-            // and reject a mismatch outright — otherwise a lying node can
-            // fast-forward lastProcessedBlock past real deposits.
-            if (block.height !== h) {
-              throw new Error(`node returned block height ${block.height} for requested height ${h}`);
-            }
-            return block;
-          }),
-        );
+        const blocks: Awaited<ReturnType<typeof fetchBlock>>[] = [];
+        for (let i = 0; i < heights.length; i += concurrency) {
+          blocks.push(...(await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock))));
+        }
 
         // Snapshot so a failed root check can't leave partial state behind.
         const snapshot = {
@@ -328,9 +349,59 @@ export class PivxWallet {
   }
 
   /**
+   * Confirm the starting commitment tree against the node before scanning
+   * forward. A fresh wallet begins at a bundled checkpoint; if that
+   * checkpoint's tree does not match the node's sapling root at that height
+   * (some near-tip checkpoints in the shield library are captured on stale
+   * blocks), walk back to the newest checkpoint the node does confirm. A
+   * wallet that already holds scanned notes and no longer matches is treated
+   * as diverged rather than silently rewound.
+   */
+  private async ensureValidCheckpoint(client: PivxClient): Promise<void> {
+    if (this.startValidated) return;
+    const rootAt = async (h: number): Promise<string | null> => {
+      if (h <= 0) return null;
+      const block = (await client.getBlock(await client.getBlockHash(h), 1)) as {
+        finalsaplingroot?: string;
+      };
+      return block.finalsaplingroot ?? null;
+    };
+    const localRoot = () => reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
+
+    const node = await rootAt(this.lastProcessedBlock);
+    if (node === null || localRoot() === node) {
+      this.startValidated = true;
+      return;
+    }
+    if (this.notes.length > 0 || this.pendingSpends.size > 0) {
+      throw new ScanDivergedError(this.lastProcessedBlock, localRoot(), node);
+    }
+
+    let probe = this.lastProcessedBlock - 1;
+    let lastCp = this.lastProcessedBlock;
+    while (probe > 0) {
+      const [cpHeight, cpTree] = this.shield.get_closest_checkpoint(probe, this.isTestnet) as [
+        number,
+        string,
+      ];
+      if (cpHeight >= lastCp) break; // no older checkpoint available
+      lastCp = cpHeight;
+      const nodeRoot = await rootAt(cpHeight);
+      const cpRoot = reverseHex(this.shield.get_sapling_root(cpTree) as string);
+      if (nodeRoot === null || cpRoot === nodeRoot) {
+        this.commitmentTree = cpTree;
+        this.lastProcessedBlock = cpHeight;
+        break;
+      }
+      probe = cpHeight - 1;
+    }
+    this.startValidated = true;
+  }
+
+  /**
    * Reset scan state to the checkpoint at or below `height` and drop all
-   * tracked notes. The documented recovery from {@link ScanDivergedError}:
-   * call this, then {@link sync}. Requires no keys.
+   * tracked notes. This is the recovery path after a divergence error: call
+   * it, then sync again. It needs no keys.
    */
   reloadFromCheckpoint(height: number): void {
     if (this.busy) throw new Error('wallet is busy');
@@ -343,6 +414,7 @@ export class PivxWallet {
     this.notes = [];
     this.nullifierMap = new Map();
     this.pendingSpends = new Map();
+    this.startValidated = false; // re-confirm the checkpoint on the next sync
   }
 
   // ── Spending ──────────────────────────────────────────────────────────────
