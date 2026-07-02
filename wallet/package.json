@@ -1,0 +1,41 @@
+{
+  "name": "pivx-wallet",
+  "version": "0.1.0",
+  "description": "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "pivx",
+    "wallet",
+    "sapling",
+    "shield",
+    "sdk",
+    "payments"
+  ],
+  "dependencies": {
+    "pivx-rpc": "^0.1.0",
+    "pivx-shield-rust": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^5.5.0"
+  }
+}

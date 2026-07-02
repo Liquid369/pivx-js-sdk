@@ -1,0 +1,8 @@
+{
+  "name": "pivx-js-sdk",
+  "private": true,
+  "workspaces": [
+    "rpc",
+    "wallet"
+  ]
+}

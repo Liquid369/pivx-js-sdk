@@ -1,0 +1,217 @@
+import type {
+  BlockchainInfo,
+  ReceivedShieldNote,
+  ShieldNote,
+  ShieldRecipient,
+  ShieldSendSource,
+  ShieldTxView,
+  Unspent,
+  WalletInfo,
+} from './types.js';
+
+export interface PivxClientOptions {
+  /** Full URL, e.g. "http://127.0.0.1:51473". Overrides host/port. */
+  url?: string;
+  host?: string;
+  /** Default 51473 (mainnet). Testnet is 51475. */
+  port?: number;
+  user?: string;
+  pass?: string;
+  /** Multiwallet: routes calls to /wallet/<name>. */
+  wallet?: string;
+  /** Request timeout in milliseconds. Default 30000. */
+  timeoutMs?: number;
+}
+
+/** Error returned by the node's JSON-RPC layer (has the node's error code). */
+export class RpcError extends Error {
+  constructor(
+    public readonly code: number,
+    message: string,
+    public readonly method: string,
+  ) {
+    super(`${method}: ${message} (code ${code})`);
+    this.name = 'RpcError';
+  }
+}
+
+let nextId = 0;
+
+export class PivxClient {
+  private readonly url: string;
+  private readonly authHeader?: string;
+  private readonly timeoutMs: number;
+
+  constructor(opts: PivxClientOptions = {}) {
+    const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
+    this.url = opts.wallet ? `${base.replace(/\/$/, '')}/wallet/${opts.wallet}` : base;
+    if (opts.user !== undefined) {
+      this.authHeader = 'Basic ' + Buffer.from(`${opts.user}:${opts.pass ?? ''}`).toString('base64');
+    }
+    this.timeoutMs = opts.timeoutMs ?? 30000;
+  }
+
+  /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
+  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
+    while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
+    const res = await fetch(this.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(this.authHeader ? { authorization: this.authHeader } : {}),
+      },
+      body: JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    let body: { result?: T; error?: { code: number; message: string } | null };
+    try {
+      body = await res.json() as typeof body;
+    } catch {
+      throw new Error(`${method}: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
+    }
+    if (body.error) throw new RpcError(body.error.code, body.error.message, method);
+    if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
+    return body.result as T;
+  }
+
+  // ── Blockchain ────────────────────────────────────────────────────────────
+
+  getBlockCount() {
+    return this.call<number>('getblockcount');
+  }
+
+  getBestBlockHash() {
+    return this.call<string>('getbestblockhash');
+  }
+
+  getBlockHash(height: number) {
+    return this.call<string>('getblockhash', height);
+  }
+
+  /** verbosity: 0/false = hex, 1/true = json (default), 2 = json with full tx objects. */
+  getBlock(hash: string, verbosity: 0 | 1 | 2 | boolean = 1) {
+    return this.call<Record<string, unknown> | string>('getblock', hash, verbosity);
+  }
+
+  getBlockchainInfo() {
+    return this.call<BlockchainInfo>('getblockchaininfo');
+  }
+
+  getRawTransaction(txid: string, verbose = false) {
+    return this.call<string | Record<string, unknown>>('getrawtransaction', txid, verbose ? 1 : 0);
+  }
+
+  sendRawTransaction(hex: string) {
+    return this.call<string>('sendrawtransaction', hex);
+  }
+
+  // ── Transparent wallet ────────────────────────────────────────────────────
+
+  getBalance() {
+    return this.call<number>('getbalance');
+  }
+
+  getNewAddress(label?: string) {
+    return this.call<string>('getnewaddress', label);
+  }
+
+  listUnspent(minConf = 1, maxConf = 9999999, addresses?: string[]) {
+    return this.call<Unspent[]>('listunspent', minConf, maxConf, addresses);
+  }
+
+  sendToAddress(address: string, amount: number, comment?: string) {
+    return this.call<string>('sendtoaddress', address, amount, comment);
+  }
+
+  getTransaction(txid: string) {
+    return this.call<Record<string, unknown>>('gettransaction', txid);
+  }
+
+  getWalletInfo() {
+    return this.call<WalletInfo>('getwalletinfo');
+  }
+
+  validateAddress(address: string) {
+    return this.call<Record<string, unknown>>('validateaddress', address);
+  }
+
+  // ── Shield (SHIELD/Sapling) ───────────────────────────────────────────────
+
+  getNewShieldAddress(label?: string) {
+    return this.call<string>('getnewshieldaddress', label);
+  }
+
+  listShieldAddresses(includeWatchOnly = false) {
+    return this.call<string[]>('listshieldaddresses', includeWatchOnly);
+  }
+
+  /** Total shield balance, or the balance of one shield address ("*" = all). */
+  getShieldBalance(address = '*', minConf = 1, includeWatchOnly = false) {
+    return this.call<number>('getshieldbalance', address, minConf, includeWatchOnly);
+  }
+
+  listShieldUnspent(
+    minConf = 1,
+    maxConf = 9999999,
+    includeWatchOnly = false,
+    addresses?: string[],
+  ) {
+    return this.call<ShieldNote[]>('listshieldunspent', minConf, maxConf, includeWatchOnly, addresses);
+  }
+
+  listReceivedByShieldAddress(address: string, minConf = 1) {
+    return this.call<ReceivedShieldNote[]>('listreceivedbyshieldaddress', address, minConf);
+  }
+
+  /**
+   * Build, prove, and broadcast a shielded transaction from the node wallet.
+   * Synchronous in PIVX: resolves with the txid once accepted.
+   */
+  shieldSendMany(
+    from: ShieldSendSource,
+    recipients: ShieldRecipient[],
+    minConf?: number,
+    fee?: number,
+    subtractFeeFrom?: string[],
+  ) {
+    return this.call<string>('shieldsendmany', from, recipients, minConf, fee, subtractFeeFrom);
+  }
+
+  /** Build and prove a shielded transaction but do not broadcast; returns raw hex. */
+  rawShieldSendMany(
+    from: ShieldSendSource,
+    recipients: ShieldRecipient[],
+    minConf?: number,
+    fee?: number,
+  ) {
+    return this.call<string>('rawshieldsendmany', from, recipients, minConf, fee);
+  }
+
+  /** Decrypted view of a wallet shielded transaction (amounts, memos). */
+  viewShieldTransaction(txid: string) {
+    return this.call<ShieldTxView>('viewshieldtransaction', txid);
+  }
+
+  getSaplingNotesCount(minConf?: number) {
+    return this.call<number>('getsaplingnotescount', minConf);
+  }
+
+  // ── Sapling keys ──────────────────────────────────────────────────────────
+
+  exportSaplingKey(shieldAddr: string) {
+    return this.call<string>('exportsaplingkey', shieldAddr);
+  }
+
+  importSaplingKey(key: string, rescan?: 'yes' | 'no' | 'whenkeyisnew', height?: number) {
+    return this.call<{ address: string }>('importsaplingkey', key, rescan, height);
+  }
+
+  exportSaplingViewingKey(shieldAddr: string) {
+    return this.call<string>('exportsaplingviewingkey', shieldAddr);
+  }
+
+  /** Import an incoming viewing key for watch-only shield balance tracking. */
+  importSaplingViewingKey(vkey: string, rescan?: 'yes' | 'no' | 'whenkeyisnew', height?: number) {
+    return this.call<{ address: string }>('importsaplingviewingkey', vkey, rescan, height);
+  }
+}
