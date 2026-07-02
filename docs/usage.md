@@ -397,36 +397,111 @@ wallet.scanBlock(block);
 // (b) or register a UTXO yourself; returns false if it isn't ours
 wallet.addUtxo(txid, vout, 200_000_000, scriptPubKeyBytes);
 
-wallet.balance();   // sats
-wallet.getUtxos();  // tracked unspent outputs
+wallet.balance();   // sats — excludes outpoints reserved by buildSend
+wallet.getUtxos();  // all tracked outputs, reserved ones included
+```
+
+Only one `sync` runs at a time; a concurrent call throws (the same busy
+guard as the shield wallet).
+
+`scanBlock` checks parent-hash continuity: when a block claims to extend
+the last scanned one (height exactly one higher) but its
+`previousblockhash` differs from the hash recorded, it throws
+`ScanDivergedError` before mutating any state — the chain reorganized
+under the wallet. This is a breaking change from 0.1, where `scanBlock`
+never threw. Recover with `resetScan(height)`, which drops scanned UTXOs
+above `height` along with their reservations (caller-supplied UTXOs are
+kept) and re-sync from below the fork point:
+
+```js
+import { ScanDivergedError } from 'pivx-wallet';
+
+try {
+  await wallet.sync(client);
+} catch (e) {
+  if (!(e instanceof ScanDivergedError)) throw e;
+  wallet.resetScan(e.height - 20);   // a height below the fork point
+  await wallet.sync(client);
+}
 ```
 
 ### Sending
 
 ```js
 const { hex, spent } = wallet.buildSend('D...recipient', 150_000_000, 100);  // 100 sats/byte
-await client.sendRawTransaction(hex);
-wallet.markSpent(spent);              // only after a successful broadcast
+try {
+  await client.sendRawTransaction(hex);
+  wallet.markSpent(spent);            // finalize: inputs dropped for good
+} catch (e) {
+  // Release only when the node definitively rejected the transaction.
+  if (e instanceof RpcError) wallet.release(spent);
+  throw e;
+}
 ```
 
 `buildSend` selects coins largest-first, signs locally (ECDSA), sizes the
 fee from `feePerByte` (default 100), and sends change to a fresh internal
 address. It throws if funds can't cover amount + fee rather than
-underpaying. Call `markSpent(spent)` only once the broadcast succeeds —
-until then the UTXOs stay spendable, so a failed broadcast can be retried.
-This send path is verified against real mainnet transactions.
+underpaying. The inputs it selects are reserved: a second `buildSend`
+cannot double-spend them before broadcast, and `balance()` excludes them
+(`getUtxos()` still lists them). `markSpent(spent)` finalizes after a
+successful broadcast; `release(spent)` un-reserves after a definitive node
+rejection (`RpcError`). A transport or timeout failure is ambiguous — the
+node may have accepted the transaction — so keep the reservation until
+the txid confirms or clearly disappears, the same rule as the shield
+wallet's discard. This send path is verified against real mainnet
+transactions.
+
+### Persistence
+
+`save()` returns versioned JSON (version 1) holding the address cursors,
+the UTXO set (with coinbase heights), reservations (pending spends), and
+the last-scanned height and block hash — no key material.
+`load(seed, state)` re-derives the keys from the seed and rejects a state
+that does not match it. The output is byte-identical across the JS and
+Rust SDKs — a state saved by one loads in the other (the test suites
+byte-compare a shared fixture).
+
+```js
+const json = wallet.save();
+// ... crash, restart, maybe another host or the Rust SDK
+const restored = TransparentWallet.load(seed, json);
+```
+
+Reservations survive save/load, so a crash between broadcast and
+`markSpent` cannot resurrect the inputs into a double-spend — provided the
+state was saved after the send. Save after every sync and every send.
 
 ### Exchange addresses
 
-Exchange addresses (`EXM` mainnet, `EXT` testnet) are a receive-only
-transparent variant. Validate them and send to them like any address; the
-output carries an `OP_EXCHANGEADDR` prefix on an otherwise standard P2PKH
-script.
+Exchange addresses (`EXM` mainnet, `EXT` testnet) encode the same hash160
+as a P2PKH address behind an `OP_EXCHANGEADDR` (`0xe0`) prefix on an
+otherwise standard P2PKH script. The wallet both sends to them and
+receives on them.
+
+Sending — validate and pay them like any address:
 
 ```js
 isValidAddress('EXM...');             // true
 decodeAddress('EXM...').kind;         // 'exchange'
 const { hex, spent } = wallet.buildSend('EXM...', 150_000_000, 100);
 ```
+
+Receiving — `newExchangeAddress()` hands out the next external index
+encoded as an exchange address. It shares the cursor and key with
+`newAddress()`: the same index's P2PKH form pays this wallet too, the two
+encodings differ only in scriptPubKey. Deposits through the 26-byte
+exchange script are credited by `scanBlock` and `addUtxo` exactly like
+P2PKH, and the UTXOs spend like any other:
+
+```js
+const exm = wallet.newExchangeAddress();   // 'EXM...'
+// after the deposit confirms and a sync/scan picks it up:
+wallet.balance();                          // includes the exchange-script UTXO
+```
+
+This path is verified on mainnet: a deposit to an exchange address was
+detected by a real block scan and the received output spent, accepted by
+the network.
 
 Sending to a cold-staking address is rejected.

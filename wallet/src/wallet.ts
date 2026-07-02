@@ -91,8 +91,8 @@ export class ScanDivergedError extends Error {
     public readonly nodeRoot: string,
   ) {
     super(
-      `sapling root mismatch at height ${height}: wallet state is corrupt or the node is on another chain; ` +
-        'recreate the wallet from its keys and resync',
+      `scan diverged at height ${height}: wallet state is corrupt or the node is on another chain; ` +
+        'recreate the wallet from its keys (or resetScan for a transparent wallet) and resync',
     );
     this.name = 'ScanDivergedError';
   }

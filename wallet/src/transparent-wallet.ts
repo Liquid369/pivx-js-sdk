@@ -9,8 +9,11 @@
 import type { PivxClient } from 'pivx-rpc';
 import { decodeAddress, deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
 import { buildTransparentTx, scriptPubKeyForAddress, type TxInput } from './transparent-tx.js';
+import { ScanDivergedError } from './wallet.js';
 
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+const fromHex = (s: string): Uint8Array => Uint8Array.from((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
+const isHex = (s: string): boolean => /^(?:[0-9a-fA-F]{2})+$/.test(s);
 
 /**
  * PIVX dust threshold (sats) for an output whose scriptPubKey is `scriptLen`
@@ -47,14 +50,26 @@ export interface ScannedInput {
   vout: number;
 }
 
-/** hash160 of a standard P2PKH scriptPubKey (76a914<20>88ac), if it is one. */
-function p2pkhHash(script: Uint8Array): string | undefined {
+/**
+ * hash160 of a scriptPubKey we know how to spend, if it is one: a standard
+ * 25-byte P2PKH (76a914<20>88ac) or the 26-byte exchange form with an
+ * OP_EXCHANGEADDR prefix (e076a914<20>88ac) — per Solver's TX_EXCHANGEADDR in
+ * PIVX src/script/standard.cpp. Both encodings pay the same key.
+ */
+function ownedScriptHash(script: Uint8Array): string | undefined {
   if (
     script.length === 25 &&
     script[0] === 0x76 && script[1] === 0xa9 && script[2] === 0x14 &&
     script[23] === 0x88 && script[24] === 0xac
   ) {
     return hex(script.slice(3, 23));
+  }
+  if (
+    script.length === 26 && script[0] === 0xe0 &&
+    script[1] === 0x76 && script[2] === 0xa9 && script[3] === 0x14 &&
+    script[24] === 0x88 && script[25] === 0xac
+  ) {
+    return hex(script.slice(4, 24));
   }
   return undefined;
 }
@@ -67,6 +82,12 @@ export class TransparentWallet {
   private nextChange = 0;
   private utxos = new Map<string, OwnedUtxo>(); // "txid:vout" → utxo
   private lastScanned = 0; // height of the last block passed to scanBlock
+  private lastScannedHash: string | null = null; // hash of that block, for reorg detection
+  private pending = new Set<string>(); // "txid:vout" reserved by buildSend until markSpent/release
+  /** One sync at a time (mirrors the shield wallet's busy guard). */
+  private busy = false;
+  private account = 0;
+  private gap = 0;
 
   private constructor(private readonly network: Network) {}
 
@@ -76,6 +97,8 @@ export class TransparentWallet {
    */
   static create(seed: Uint8Array, network: Network, account = 0, gap = 100): TransparentWallet {
     const w = new TransparentWallet(network);
+    w.account = account;
+    w.gap = gap;
     for (let i = 0; i < gap; i++) {
       const ext = deriveKey(seed, network, account, 0, i);
       const eh = hex(hash160(ext.publicKey));
@@ -95,6 +118,20 @@ export class TransparentWallet {
     if (!e) throw new Error('address gap limit reached; increase gap');
     this.nextExternal++;
     return e.address;
+  }
+
+  /**
+   * Next unused external receive address, encoded as an exchange (EXM)
+   * address. Shares the address cursor with {@link newAddress}: it hands out
+   * the same underlying key as the next {@link newAddress} would, so the same
+   * index's P2PKH encoding also pays this wallet — the two forms differ only
+   * in their scriptPubKey encoding.
+   */
+  newExchangeAddress(): string {
+    const e = this.external[this.nextExternal];
+    if (!e) throw new Error('address gap limit reached; increase gap');
+    this.nextExternal++;
+    return encodeAddress(fromHex(e.hash), this.network, 'exchange');
   }
 
   private nextChangeHash(): string {
@@ -121,7 +158,7 @@ export class TransparentWallet {
     coinbase: boolean,
     height: number,
   ): boolean {
-    const h = p2pkhHash(scriptPubKey);
+    const h = ownedScriptHash(scriptPubKey);
     if (h && this.keys.has(h)) {
       this.utxos.set(`${txid}:${vout}`, { txid, vout, amount, scriptPubKey, keyHash: h, coinbase, height });
       return true;
@@ -132,15 +169,36 @@ export class TransparentWallet {
   /** Apply a scanned block's transparent outputs (added if ours) and spent inputs (removed). */
   scan(outputs: ScannedOutput[], spent: ScannedInput[]): void {
     for (const o of outputs) this.addUtxo(o.txid, o.vout, o.amount, o.scriptPubKey);
-    for (const s of spent) this.utxos.delete(`${s.txid}:${s.vout}`);
+    for (const s of spent) this.removeUtxo(`${s.txid}:${s.vout}`);
+  }
+
+  /** Drop a UTXO and any reservation on it (spent on-chain — nothing left to reserve). */
+  private removeUtxo(key: string): void {
+    this.utxos.delete(key);
+    this.pending.delete(key);
   }
 
   /**
    * Scan one decoded block (`getblock <hash> 2`): credit every output that
    * pays us and remove every tracked UTXO the block spends. Coinbase vins (no
-   * prevout `txid`) are skipped. Records the block's height as last scanned.
+   * prevout `txid`) are skipped. Records the block's height and hash as last
+   * scanned.
+   *
+   * Throws {@link ScanDivergedError} — before mutating any state — when the
+   * block claims to extend the last scanned block (height + 1) but its
+   * `previousblockhash` does not match the last scanned hash: the chain
+   * reorganized under us. Recover with {@link resetScan} below the fork point
+   * and re-sync.
    */
   scanBlock(block: any): void {
+    if (
+      this.lastScannedHash !== null &&
+      block.height === this.lastScanned + 1 &&
+      typeof block.previousblockhash === 'string' &&
+      block.previousblockhash !== this.lastScannedHash
+    ) {
+      throw new ScanDivergedError(block.height, this.lastScannedHash, block.previousblockhash);
+    }
     if (typeof block.height === 'number') this.lastScanned = block.height;
     const height = this.lastScanned;
     for (const tx of block.tx ?? []) {
@@ -161,9 +219,10 @@ export class TransparentWallet {
         this.insertUtxo(tx.txid, o.n, Math.round(o.value * 1e8), script, coinbase, height);
       }
       for (const i of tx.vin ?? []) {
-        if (i.txid !== undefined) this.utxos.delete(`${i.txid}:${i.vout}`);
+        if (i.txid !== undefined) this.removeUtxo(`${i.txid}:${i.vout}`);
       }
     }
+    this.lastScannedHash = typeof block.hash === 'string' ? block.hash : null;
   }
 
   /** Height of the last block passed to {@link scanBlock} (0 if none). */
@@ -172,10 +231,29 @@ export class TransparentWallet {
   }
 
   /**
+   * Recovery path after {@link ScanDivergedError}: reset the scan position to
+   * `height` (choose one below the fork point) and re-sync. Every scanned UTXO
+   * above that height is dropped, along with its reservation; caller-supplied
+   * UTXOs (tracked at height 0) are kept.
+   */
+  resetScan(height: number): void {
+    for (const [k, u] of this.utxos) {
+      if (u.height > height && u.height > 0) {
+        this.utxos.delete(k);
+        this.pending.delete(k);
+      }
+    }
+    this.lastScanned = height;
+    this.lastScannedHash = null;
+  }
+
+  /**
    * Sync from the node into the wallet, from `max(fromHeight, lastScanned+1)`
    * up to the current tip, fetching each block with getBlockHash +
    * getBlock(hash, 2) and feeding it to {@link scanBlock}. Blocks are fetched
-   * with bounded concurrency but scanned in ascending order.
+   * with bounded concurrency but scanned in ascending order. Only one sync may
+   * run at a time; a concurrent call throws. A {@link ScanDivergedError} from
+   * {@link scanBlock} (reorg) propagates to the caller.
    *
    * Like the shield wallet's sync this is a chain-data pull, not chain
    * authentication: point it at a node you trust. See SECURITY.md.
@@ -188,30 +266,53 @@ export class TransparentWallet {
       onProgress?: (height: number, tip: number) => void;
     } = {},
   ): Promise<void> {
-    const concurrency = 8;
-    const tip = await client.getBlockCount();
-    const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
-    // NaN/0/fractional → sane integer: 0 would loop forever and fractional
-    // heights would skip blocks (matches Rust batch.max(1)).
-    const batch = Math.max(1, Math.floor(batchSize) || 1);
-    let from = Math.max(fromHeight, this.lastScanned + 1);
-    while (from <= tip) {
-      const to = Math.min(from + batch - 1, tip);
-      const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
-      for (let i = 0; i < heights.length; i += concurrency) {
-        const blocks = await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock));
-        for (const block of blocks) this.scanBlock(block);
+    if (this.busy) throw new Error('wallet is busy: another sync is in progress');
+    this.busy = true;
+    try {
+      const concurrency = 8;
+      const tip = await client.getBlockCount();
+      const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
+      // NaN/0/fractional → sane integer: 0 would loop forever and fractional
+      // heights would skip blocks (matches Rust batch.max(1)).
+      const batch = Math.max(1, Math.floor(batchSize) || 1);
+      let from = Math.max(fromHeight, this.lastScanned + 1);
+      while (from <= tip) {
+        const to = Math.min(from + batch - 1, tip);
+        const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
+        for (let i = 0; i < heights.length; i += concurrency) {
+          const blocks = await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock));
+          for (const b of blocks) {
+            // getblock verbosity 2 always carries these; a block without them
+            // would silently disable the reorg continuity check, so treat it
+            // as a malformed node response rather than scanning past it.
+            const block = b as any;
+            if (typeof block?.hash !== 'string' || typeof block?.previousblockhash !== 'string') {
+              throw new Error(`node returned a block without hash/previousblockhash at height ${block?.height}`);
+            }
+            this.scanBlock(block);
+          }
+        }
+        onProgress?.(to, tip);
+        from = to + 1;
       }
-      onProgress?.(to, tip);
-      from = to + 1;
+    } finally {
+      this.busy = false;
     }
   }
 
-  /** Total tracked transparent balance in satoshis. */
+  /**
+   * Total spendable transparent balance in satoshis. Outputs reserved by
+   * {@link buildSend} are excluded (like the shield wallet's pending-note
+   * exclusion); {@link getUtxos} still lists them.
+   */
   balance(): number {
-    return [...this.utxos.values()].reduce((s, u) => s + u.amount, 0);
+    return [...this.utxos.values()].reduce(
+      (s, u) => (this.pending.has(`${u.txid}:${u.vout}`) ? s : s + u.amount),
+      0,
+    );
   }
 
+  /** All tracked UTXOs, including ones reserved by {@link buildSend} (unlike {@link balance}). */
   getUtxos(): readonly OwnedUtxo[] {
     return [...this.utxos.values()];
   }
@@ -224,6 +325,10 @@ export class TransparentWallet {
    * Build and sign a transparent send of `amount` sats to `to`, selecting
    * UTXOs largest-first with change to a fresh change address. `feePerByte`
    * defaults to 100 sats/byte. Returns the raw tx hex and the spent inputs.
+   *
+   * The selected inputs are reserved: a later buildSend will not select them
+   * again until {@link markSpent} (broadcast succeeded) or {@link release}
+   * (broadcast definitively rejected) resolves them.
    */
   buildSend(
     to: string,
@@ -242,10 +347,12 @@ export class TransparentWallet {
     const toScript = scriptPubKeyForAddress(to);
     if (amount < dustThreshold(toScript.length)) throw new Error('amount is below the dust threshold');
     const feerate = feePerByte;
-    // Exclude immature coinbase/coinstake outputs: the node rejects a spend of
-    // one before nCoinbaseMaturity confirmations (depth vs. last scanned block).
+    // Exclude reserved outpoints (awaiting markSpent/release) and immature
+    // coinbase/coinstake outputs: the node rejects a spend of one before
+    // nCoinbaseMaturity confirmations (depth vs. last scanned block).
     const maturity = coinbaseMaturity(this.network);
     const avail = [...this.utxos.values()]
+      .filter((u) => !this.pending.has(`${u.txid}:${u.vout}`))
       .filter((u) => !(u.coinbase && this.lastScanned - u.height + 1 < maturity))
       .sort((a, b) => b.amount - a.amount);
     const selected: OwnedUtxo[] = [];
@@ -264,11 +371,7 @@ export class TransparentWallet {
     // the tx is rejected as dust) and the fee to later spend the change input.
     // Change is always P2PKH (25-byte script).
     if (changeVal > Math.max(feerate * 148, dustThreshold(25))) {
-      const chAddr = encodeAddress(
-        Uint8Array.from(this.nextChangeHash().match(/../g)!.map((b) => parseInt(b, 16))),
-        this.network,
-        'p2pkh',
-      );
+      const chAddr = encodeAddress(fromHex(this.nextChangeHash()), this.network, 'p2pkh');
       outputs.push({ address: chAddr, amount: changeVal });
     }
 
@@ -280,12 +383,142 @@ export class TransparentWallet {
       privateKey: this.keys.get(u.keyHash)!,
     }));
     const spent = selected.map((u) => ({ txid: u.txid, vout: u.vout }));
-    return { hex: buildTransparentTx(inputs, outputs, 0), spent };
+    const rawHex = buildTransparentTx(inputs, outputs, 0);
+    for (const s of spent) this.pending.add(`${s.txid}:${s.vout}`);
+    return { hex: rawHex, spent };
   }
 
-  /** Mark inputs spent after a successful broadcast. */
+  /** Mark inputs spent after a successful broadcast (drops them and their reservation). */
   markSpent(spent: { txid: string; vout: number }[]): void {
-    for (const s of spent) this.utxos.delete(`${s.txid}:${s.vout}`);
+    for (const s of spent) {
+      this.utxos.delete(`${s.txid}:${s.vout}`);
+      this.pending.delete(`${s.txid}:${s.vout}`);
+    }
+  }
+
+  /**
+   * Release inputs reserved by {@link buildSend} after a definitively
+   * rejected broadcast: they become selectable again. On an ambiguous failure
+   * (timeout), keep them reserved until the transaction confirms or clearly
+   * disappears.
+   */
+  release(spent: { txid: string; vout: number }[]): void {
+    for (const s of spent) this.pending.delete(`${s.txid}:${s.vout}`);
+  }
+
+  // ── Persistence ───────────────────────────────────────────────────────────
+
+  /**
+   * Serialize wallet state to JSON (cross-SDK state format, version 1). No
+   * key material is included — restore with {@link load} and the seed.
+   */
+  save(): string {
+    return JSON.stringify({
+      version: 1,
+      network: this.network,
+      account: this.account,
+      gap: this.gap,
+      nextExternal: this.nextExternal,
+      nextChange: this.nextChange,
+      lastScanned: this.lastScanned,
+      lastScannedHash: this.lastScannedHash,
+      // Sorted by (txid, vout) so save() output is deterministic and
+      // byte-comparable with the Rust SDK's.
+      utxos: [...this.utxos.values()]
+        .sort((a, b) => (a.txid < b.txid ? -1 : a.txid > b.txid ? 1 : a.vout - b.vout))
+        .map((u) => ({
+          txid: u.txid,
+          vout: u.vout,
+          amount: u.amount,
+          scriptPubKey: hex(u.scriptPubKey),
+          keyHash: u.keyHash,
+          coinbase: u.coinbase,
+          height: u.height,
+        })),
+      pending: [...this.pending]
+        .map((k) => {
+          const [txid, vout] = k.split(':');
+          return { txid, vout: Number(vout) };
+        })
+        .sort((a, b) => (a.txid < b.txid ? -1 : a.txid > b.txid ? 1 : a.vout - b.vout)),
+    });
+  }
+
+  /**
+   * Restore a wallet from {@link save} output: re-derives keys from `seed`
+   * (same network/account/gap as saved) and restores scan position, UTXOs,
+   * and reservations. Throws if the state is malformed or does not belong to
+   * this seed.
+   */
+  static load(seed: Uint8Array, state: string): TransparentWallet {
+    let s: any;
+    try {
+      s = JSON.parse(state);
+    } catch {
+      throw new Error('wallet state is not valid JSON');
+    }
+    if (s === null || typeof s !== 'object') throw new Error('wallet state is not an object');
+    if (s.version !== 1) throw new Error(`unsupported wallet state version ${s.version}`);
+    if (s.network !== 'mainnet' && s.network !== 'testnet') {
+      throw new Error('wallet state has an invalid network');
+    }
+    const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+    if (!isCount(s.account) || !isCount(s.gap) || !isCount(s.nextExternal) || !isCount(s.nextChange) || !isCount(s.lastScanned)) {
+      throw new Error('wallet state has invalid counters');
+    }
+    // Bound attacker-controlled derivation work: load() re-derives 2*gap keys,
+    // so an oversized gap in a hostile state file is a hang-on-load DoS.
+    // account must fit a hardened BIP32 index.
+    if (s.gap > 10_000) throw new Error('wallet state gap exceeds the supported maximum (10000)');
+    if (s.account >= 0x80000000) throw new Error('wallet state account exceeds the BIP32 hardened range');
+    if (s.lastScannedHash !== null && typeof s.lastScannedHash !== 'string') {
+      throw new Error('wallet state has an invalid last-scanned hash');
+    }
+    if (!Array.isArray(s.utxos) || !Array.isArray(s.pending)) {
+      throw new Error('wallet state has invalid utxo or pending lists');
+    }
+    const w = TransparentWallet.create(seed, s.network, s.account, s.gap);
+    w.nextExternal = s.nextExternal;
+    w.nextChange = s.nextChange;
+    w.lastScanned = s.lastScanned;
+    w.lastScannedHash = s.lastScannedHash;
+    const isTxid = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v);
+    for (const u of s.utxos) {
+      if (
+        !isTxid(u?.txid) || !isCount(u.vout) ||
+        !Number.isSafeInteger(u.amount) || u.amount < 0 ||
+        typeof u.scriptPubKey !== 'string' || !isHex(u.scriptPubKey) ||
+        typeof u.keyHash !== 'string' || typeof u.coinbase !== 'boolean' || !isCount(u.height)
+      ) {
+        throw new Error('wallet state contains a malformed utxo');
+      }
+      if (!w.keys.has(u.keyHash)) {
+        throw new Error('wallet state does not match seed: utxo key hash is not derived from it');
+      }
+      const script = fromHex(u.scriptPubKey);
+      // The scriptPubKey must actually pay the claimed key: otherwise a
+      // hostile state file could make buildSend sign an arbitrary foreign
+      // script (used verbatim as the sighash scriptCode) with our key.
+      if (ownedScriptHash(script) !== u.keyHash) {
+        throw new Error('wallet state contains a utxo whose script does not pay its key hash');
+      }
+      w.utxos.set(`${u.txid}:${u.vout}`, {
+        txid: u.txid,
+        vout: u.vout,
+        amount: u.amount,
+        scriptPubKey: script,
+        keyHash: u.keyHash,
+        coinbase: u.coinbase,
+        height: u.height,
+      });
+    }
+    for (const p of s.pending) {
+      if (!isTxid(p?.txid) || !isCount(p.vout)) {
+        throw new Error('wallet state contains a malformed pending entry');
+      }
+      w.pending.add(`${p.txid}:${p.vout}`);
+    }
+    return w;
   }
 }
 
