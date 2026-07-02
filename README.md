@@ -29,6 +29,8 @@ const txid = await wallet.send(client, { to: 'ps1…', amount: 150_000_000, memo
 Examples: [`wallet/examples/`](wallet/examples/) (deposit watcher,
 standalone send), [`rpc/examples/`](rpc/examples/) (node-wallet flows).
 
+Full usage guide: [docs/usage.md](docs/usage.md).
+
 ## Develop
 
 ```
