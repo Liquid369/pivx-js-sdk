@@ -20,6 +20,36 @@ test('tracks own UTXOs, ignores others, selects and spends', () => {
   assert.equal(w.balance(), 0);
 });
 
+test('scanBlock credits our outputs and removes spends', () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(7), 'mainnet', 0, 20);
+  const a0 = deriveKey(new Uint8Array(32).fill(7), 'mainnet', 0, 0, 0);
+  const spkHex = [...scriptPubKeyForAddress(a0.address)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  // Block 100: a tx paying us 1.5 PIV at vout 0 (coinbase vin skipped).
+  w.scanBlock({
+    height: 100,
+    tx: [{
+      txid: 'aa'.repeat(32),
+      vin: [{ coinbase: '00' }],
+      vout: [{ n: 0, value: 1.5, scriptPubKey: { hex: spkHex } }],
+    }],
+  });
+  assert.equal(w.balance(), 150_000_000);
+  assert.equal(w.lastScannedBlock(), 100);
+
+  // Block 101: a tx spending that UTXO (aa:0).
+  w.scanBlock({
+    height: 101,
+    tx: [{
+      txid: 'bb'.repeat(32),
+      vin: [{ txid: 'aa'.repeat(32), vout: 0 }],
+      vout: [],
+    }],
+  });
+  assert.equal(w.balance(), 0);
+  assert.equal(w.lastScannedBlock(), 101);
+});
+
 test('insufficient balance throws', () => {
   const w = TransparentWallet.create(new Uint8Array(32).fill(4), 'mainnet', 0, 5);
   const a0 = deriveKey(new Uint8Array(32).fill(4), 'mainnet', 0, 0, 0);

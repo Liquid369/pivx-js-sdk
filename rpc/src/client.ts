@@ -250,4 +250,109 @@ export class PivxClient {
   importSaplingViewingKey(vkey: string, rescan?: 'yes' | 'no' | 'whenkeyisnew', height?: number) {
     return this.call<{ address: string }>('importsaplingviewingkey', vkey, rescan, height);
   }
+
+  // ── Masternode ──────────────────────────────────────────────────────────────
+
+  getMasternodeCount() {
+    return this.call<number>('getmasternodecount');
+  }
+
+  /** Legacy masternode list; filter matches address/txhash/status/etc. */
+  listMasternodes(filter?: string) {
+    return this.call<unknown[]>('listmasternodes', filter);
+  }
+
+  /** This node's masternode status (errors if the node isn't a masternode). */
+  getMasternodeStatus() {
+    return this.call<Record<string, unknown>>('getmasternodestatus');
+  }
+
+  /** The masternode currently scheduled to be paid. */
+  masternodeCurrent() {
+    return this.call<Record<string, unknown>>('masternodecurrent');
+  }
+
+  // ── Deterministic MN (evo) ────────────────────────────────────────────────────
+
+  /** Deterministic masternode list. All args optional (node defaults). */
+  protxList(detailed?: boolean, walletOnly?: boolean, validOnly?: boolean, height?: number) {
+    return this.call<unknown[]>('protx_list', detailed, walletOnly, validOnly, height);
+  }
+
+  // ── Budget / governance ───────────────────────────────────────────────────────
+
+  /** Budget proposal(s); name limits the result to one proposal. */
+  getBudgetInfo(name?: string) {
+    return this.call<unknown[]>('getbudgetinfo', name);
+  }
+
+  getBudgetProjection() {
+    return this.call<unknown[]>('getbudgetprojection');
+  }
+
+  // ── Staking / cold-staking ──────────────────────────────────────────────────────
+
+  getStakingStatus() {
+    return this.call<Record<string, unknown>>('getstakingstatus');
+  }
+
+  listStakingAddresses() {
+    return this.call<unknown[]>('liststakingaddresses');
+  }
+
+  getColdStakingBalance() {
+    return this.call<number>('getcoldstakingbalance');
+  }
+
+  // ── Network / mempool / mining / util ─────────────────────────────────────────
+
+  getPeerInfo() {
+    return this.call<unknown[]>('getpeerinfo');
+  }
+
+  getConnectionCount() {
+    return this.call<number>('getconnectioncount');
+  }
+
+  getNetworkInfo() {
+    return this.call<Record<string, unknown>>('getnetworkinfo');
+  }
+
+  getMempoolInfo() {
+    return this.call<Record<string, unknown>>('getmempoolinfo');
+  }
+
+  /** verbose false = array of txids, true = object keyed by txid. */
+  getRawMempool(verbose?: boolean) {
+    return this.call<string[] | Record<string, unknown>>('getrawmempool', verbose);
+  }
+
+  /** Estimated fee-per-kB for confirmation within nblocks; -1 if unknown. */
+  estimateFee(nblocks: number) {
+    return this.call<number>('estimatefee', nblocks);
+  }
+
+  /** { feerate, blocks }; feerate is -1 if not enough data. */
+  estimateSmartFee(nblocks: number) {
+    return this.call<Record<string, unknown>>('estimatesmartfee', nblocks);
+  }
+
+  getMiningInfo() {
+    return this.call<Record<string, unknown>>('getmininginfo');
+  }
+
+  /** True if signature is a valid signing of message by address. */
+  verifyMessage(address: string, signature: string, message: string) {
+    return this.call<boolean>('verifymessage', address, signature, message);
+  }
+
+  /** Coin supply totals (transparent + shield). forceUpdate recomputes. */
+  getSupplyInfo(forceUpdate?: boolean) {
+    return this.call<Record<string, unknown>>('getsupplyinfo', forceUpdate);
+  }
+
+  /** Aggregate stats over `range` blocks ending at `height`. */
+  getBlockIndexStats(height: number, range: number) {
+    return this.call<Record<string, unknown>>('getblockindexstats', height, range);
+  }
 }

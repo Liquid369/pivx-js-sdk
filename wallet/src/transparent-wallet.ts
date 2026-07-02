@@ -6,6 +6,7 @@
  * PIVX has no address index, so UTXOs are discovered either by scanning blocks
  * ({@link scan}) or supplied by the caller ({@link addUtxo}).
  */
+import type { PivxClient } from 'pivx-rpc';
 import { deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
 import { buildTransparentTx, scriptPubKeyForAddress, type TxInput } from './transparent-tx.js';
 
@@ -51,6 +52,7 @@ export class TransparentWallet {
   private nextExternal = 0;
   private nextChange = 0;
   private utxos = new Map<string, OwnedUtxo>(); // "txid:vout" → utxo
+  private lastScanned = 0; // height of the last block passed to scanBlock
 
   private constructor(private readonly network: Network) {}
 
@@ -102,6 +104,62 @@ export class TransparentWallet {
   scan(outputs: ScannedOutput[], spent: ScannedInput[]): void {
     for (const o of outputs) this.addUtxo(o.txid, o.vout, o.amount, o.scriptPubKey);
     for (const s of spent) this.utxos.delete(`${s.txid}:${s.vout}`);
+  }
+
+  /**
+   * Scan one decoded block (`getblock <hash> 2`): credit every output that
+   * pays us and remove every tracked UTXO the block spends. Coinbase vins (no
+   * prevout `txid`) are skipped. Records the block's height as last scanned.
+   */
+  scanBlock(block: any): void {
+    if (typeof block.height === 'number') this.lastScanned = block.height;
+    for (const tx of block.tx ?? []) {
+      for (const o of tx.vout ?? []) {
+        const script = Uint8Array.from((o.scriptPubKey.hex.match(/../g) ?? []).map((b: string) => parseInt(b, 16)));
+        this.addUtxo(tx.txid, o.n, Math.round(o.value * 1e8), script);
+      }
+      for (const i of tx.vin ?? []) {
+        if (i.txid !== undefined) this.utxos.delete(`${i.txid}:${i.vout}`);
+      }
+    }
+  }
+
+  /** Height of the last block passed to {@link scanBlock} (0 if none). */
+  lastScannedBlock(): number {
+    return this.lastScanned;
+  }
+
+  /**
+   * Sync from the node into the wallet, from `max(fromHeight, lastScanned+1)`
+   * up to the current tip, fetching each block with getBlockHash +
+   * getBlock(hash, 2) and feeding it to {@link scanBlock}. Blocks are fetched
+   * with bounded concurrency but scanned in ascending order.
+   *
+   * Like the shield wallet's sync this is a chain-data pull, not chain
+   * authentication: point it at a node you trust. See SECURITY.md.
+   */
+  async sync(
+    client: PivxClient,
+    { fromHeight = 0, batchSize = 100, onProgress }: {
+      fromHeight?: number;
+      batchSize?: number;
+      onProgress?: (height: number, tip: number) => void;
+    } = {},
+  ): Promise<void> {
+    const concurrency = 8;
+    const tip = await client.getBlockCount();
+    const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
+    let from = Math.max(fromHeight, this.lastScanned + 1);
+    while (from <= tip) {
+      const to = Math.min(from + batchSize - 1, tip);
+      const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
+      for (let i = 0; i < heights.length; i += concurrency) {
+        const blocks = await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock));
+        for (const block of blocks) this.scanBlock(block);
+      }
+      onProgress?.(to, tip);
+      from = to + 1;
+    }
   }
 
   /** Total tracked transparent balance in satoshis. */
