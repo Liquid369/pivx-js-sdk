@@ -48,6 +48,33 @@ function estimateShieldSelection(
   return { fee, sufficient: total >= amount + fee };
 }
 
+/**
+ * Same model for the transparent-input (shielding) path: consume UTXOs
+ * smallest-first with a per-transparent-input fee and a transparent change
+ * output, and report whether they cover amount + fee. The WASM's utxo
+ * selection has the same silent-underpay behavior as its note path.
+ */
+function estimateTransparentSelection(
+  utxos: TransparentInput[],
+  amount: number,
+  toIsShield: boolean,
+): { fee: number; sufficient: boolean } {
+  // Recipient (shield → 0 transparent outputs, else 1) plus a transparent change output.
+  const tOut = (toIsShield ? 0 : 1) + 1;
+  const feeFor = (tIn: number) => 1000 * (2 * 948 + tIn * 150 + tOut * 34 + 85);
+  const sorted = [...utxos].sort((a, b) => a.amount - b.amount);
+  let total = 0;
+  let tIn = 0;
+  let fee = feeFor(0);
+  for (const u of sorted) {
+    tIn++;
+    fee = feeFor(tIn);
+    total += u.amount;
+    if (total >= amount + fee) break;
+  }
+  return { fee, sufficient: total >= amount + fee };
+}
+
 /** Thrown when a watch-only wallet is asked to spend. */
 export class NoSpendAuthorityError extends Error {
   constructor() {
@@ -242,6 +269,13 @@ export class PivxWallet {
    * {@link sync}.
    */
   handleBlocks(blocks: WalletBlock[]): string[] {
+    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    return this.applyBlocks(blocks);
+  }
+
+  /** handleBlocks without the busy guard, for internal use by sync (which
+   * already holds the guard). */
+  private applyBlocks(blocks: WalletBlock[]): string[] {
     let prev = this.lastProcessedBlock;
     for (const b of blocks) {
       if (b.height <= prev) {
@@ -266,15 +300,28 @@ export class PivxWallet {
     };
 
     this.commitmentTree = result.commitment_tree;
-    this.notes = [...result.decrypted_notes, ...result.decrypted_new_notes];
-    for (const { note, nullifier } of result.decrypted_new_notes) {
-      this.nullifierMap.set(nullifier, {
-        recipient: this.encodeRecipient(note.recipient),
-        value: note.value,
-      });
-    }
     const spent = new Set(result.nullifiers);
-    this.notes = this.notes.filter((n) => !spent.has(n.nullifier));
+    // Do not retain sub-dust notes: they are never spendable (below their own
+    // input fee), so keeping them would let a dust flood grow state and
+    // per-block scan cost without bound. Their commitment is still in the tree
+    // (appended for every output during the scan), so the root stays correct.
+    this.notes = [...result.decrypted_notes, ...result.decrypted_new_notes].filter(
+      (n) => !spent.has(n.nullifier) && n.note.value > DUST_NOTE_SATS,
+    );
+    for (const { note, nullifier } of result.decrypted_new_notes) {
+      if (note.value > DUST_NOTE_SATS) {
+        this.nullifierMap.set(nullifier, {
+          recipient: this.encodeRecipient(note.recipient),
+          value: note.value,
+        });
+      }
+    }
+    // Drop pending-spend entries whose notes are now gone (the transaction
+    // confirmed and its notes were scanned out), so pendingSpends can't leak.
+    const tracked = new Set(this.notes.map((n) => n.nullifier));
+    for (const [txid, nulls] of this.pendingSpends) {
+      if (!nulls.some((n) => tracked.has(n))) this.pendingSpends.delete(txid);
+    }
     this.lastProcessedBlock = blocks[blocks.length - 1].height;
     return result.wallet_transactions;
   }
@@ -357,7 +404,7 @@ export class PivxWallet {
           nmap: new Map(this.nullifierMap),
         };
         try {
-          this.handleBlocks(
+          this.applyBlocks(
             heights.map((h, i) => ({
               height: h,
               txs: blocks[i].tx.map(({ hex, txid }) => ({ hex, txid })),
@@ -534,17 +581,22 @@ export class PivxWallet {
       (n) => !pending.has(n.nullifier) && n.note.value > DUST_NOTE_SATS,
     );
 
-    if (useShield) {
-      // Refuse a send that the inputs can't cover including the fee, unless
-      // the caller opts into sweep. This mirrors the Rust selection so the
-      // WASM can't silently pay the fee out of the recipient's amount.
-      const { sufficient } = estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to));
-      if (!sufficient && !opts.sweep) {
-        throw new Error(
-          'insufficient spendable balance to cover amount + fee; lower the amount, ' +
-            'consolidate notes, or pass sweep:true to deduct the fee from the recipient',
-        );
-      }
+    // Refuse a send the inputs can't cover including the fee, unless the
+    // caller opts into sweep. Both branches mirror the Rust selection so the
+    // WASM can't silently pay the fee out of the recipient's amount — the
+    // WASM shares the same fee model but has no such guard.
+    const sufficient = useShield
+      ? estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to)).sufficient
+      : estimateTransparentSelection(
+          opts.inputs as TransparentInput[],
+          opts.amount,
+          this.isShieldAddress(opts.to),
+        ).sufficient;
+    if (!sufficient && !opts.sweep) {
+      throw new Error(
+        'insufficient input value to cover amount + fee; lower the amount, ' +
+          'add inputs, or pass sweep:true to deduct the fee from the recipient',
+      );
     }
 
     // Prover is only needed to build; check it after the cheap validations
@@ -590,7 +642,13 @@ export class PivxWallet {
       // an operator reacting to a false "failed") double-spend or double-pay.
       // Recover per docs/deployment.md: wait for the txid to confirm or
       // clearly disappear, then resume.
-      if (err instanceof RpcError) this.discardTransaction(tx.txid);
+      if (err instanceof RpcError) {
+        this.discardTransaction(tx.txid);
+      } else if (err && typeof err === 'object') {
+        // Ambiguous failure: the notes stay pending. Attach the txid so the
+        // operator can reconcile (confirm on-chain, then finalize/discard).
+        (err as { txid?: string }).txid = tx.txid;
+      }
       throw err;
     }
   }
@@ -607,6 +665,16 @@ export class PivxWallet {
   /** Release a failed transaction's notes back to the spendable set. */
   discardTransaction(txid: string): void {
     this.pendingSpends.delete(txid);
+  }
+
+  /**
+   * Transactions built and broadcast but not yet finalized or discarded
+   * (txid → the nullifiers they spend). After a broadcast error left a spend
+   * ambiguous, use this to find the txid, confirm it on-chain, then
+   * {@link finalizeTransaction} or {@link discardTransaction}.
+   */
+  pendingTransactions(): Record<string, string[]> {
+    return Object.fromEntries(this.pendingSpends);
   }
 
   // ── Persistence ───────────────────────────────────────────────────────────
@@ -631,7 +699,18 @@ export class PivxWallet {
     return JSON.stringify(state);
   }
 
-  static async load(json: string, proving?: ProvingOptions): Promise<PivxWallet> {
+  /**
+   * Restore a wallet from {@link save} output.
+   *
+   * For a watch-only deposit scanner, pass `opts.expectedViewingKey` (the key
+   * you know this wallet should have): a tampered state file that swapped in
+   * an attacker's viewing key would otherwise silently repoint deposit
+   * addresses to the attacker. Saved-state integrity is theft-critical here.
+   */
+  static async load(
+    json: string,
+    opts: { proving?: ProvingOptions; expectedViewingKey?: string } = {},
+  ): Promise<PivxWallet> {
     let state: WalletState;
     try {
       state = JSON.parse(json) as WalletState;
@@ -646,18 +725,28 @@ export class PivxWallet {
     if (typeof state.extfvk !== 'string' || typeof state.commitmentTree !== 'string') {
       throw new Error('wallet state is missing keys or commitment tree');
     }
+    if (opts.expectedViewingKey !== undefined && opts.expectedViewingKey !== state.extfvk) {
+      throw new Error('wallet state viewing key does not match the expected key');
+    }
     if (!Number.isSafeInteger(state.lastProcessedBlock) || !Array.isArray(state.notes)) {
       throw new Error('wallet state has an invalid sync position or notes');
     }
     for (const n of state.notes) {
-      if (typeof n?.nullifier !== 'string' || !Number.isSafeInteger(n?.note?.value)) {
+      if (typeof n?.nullifier !== 'string' || !Number.isSafeInteger(n?.note?.value) || n.note.value < 0) {
         throw new Error('wallet state contains a malformed note');
       }
     }
-    if (!Array.isArray(state.diversifierIndex) || state.diversifierIndex.length !== 11) {
+    if (
+      !Array.isArray(state.diversifierIndex) ||
+      state.diversifierIndex.length !== 11 ||
+      !state.diversifierIndex.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)
+    ) {
       throw new Error('wallet state has an invalid diversifier index');
     }
-    const shield = await loadShield(proving);
+    if (state.pendingSpends !== undefined && (typeof state.pendingSpends !== 'object' || state.pendingSpends === null)) {
+      throw new Error('wallet state has an invalid pending-spends map');
+    }
+    const shield = await loadShield(opts.proving);
     // Confirm the viewing key decodes for this network before trusting it to
     // derive receive addresses (a tampered state could otherwise repoint
     // deposits to an attacker's key).

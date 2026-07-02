@@ -45,7 +45,7 @@ test('createTransaction refuses a send the balance cannot cover with fee, unless
   // More than the balance: rejected before the prover is even needed.
   await assert.rejects(
     w.createTransaction({ to: SHIELD_ADDRESS, amount: 2_000_000_000 }),
-    /insufficient spendable balance/,
+    /insufficient input value/,
   );
   // sweep bypasses the guard and proceeds to the (unloaded) prover.
   await assert.rejects(
@@ -78,6 +78,25 @@ test('load rejects a tampered viewing key or diversifier index', async () => {
   await assert.rejects(PivxWallet.load(JSON.stringify(badDiv)), /diversifier/);
   const badKey = { ...good, extfvk: 'ptestsapling-not-a-real-key' };
   await assert.rejects(PivxWallet.load(JSON.stringify(badKey)), /viewing key/);
+});
+
+test('load with expectedViewingKey rejects a swapped key', async () => {
+  const good = (await newWallet()).save();
+  const state = JSON.parse(good);
+  // Correct expected key loads fine.
+  await PivxWallet.load(good, { expectedViewingKey: state.extfvk });
+  // A state whose key was swapped is rejected when an expected key is given.
+  const other = JSON.parse((await PivxWallet.create({ seed: new Uint8Array(32).fill(9), network: 'testnet', birthHeight: BIRTH })).save());
+  const swapped = JSON.stringify({ ...state, extfvk: other.extfvk });
+  await assert.rejects(PivxWallet.load(swapped, { expectedViewingKey: state.extfvk }), /does not match/);
+});
+
+test('pendingTransactions exposes in-flight spends for reconciliation', async () => {
+  const w = await newWallet();
+  w.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);
+  const nullifier = w.getNotes()[0].nullifier;
+  w['pendingSpends'].set('tx-abc', [nullifier]);
+  assert.deepEqual(w.pendingTransactions(), { 'tx-abc': [nullifier] });
 });
 
 test('reloadFromCheckpoint resets scan state', async () => {
