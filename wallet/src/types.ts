@@ -59,6 +59,12 @@ export interface CreateTransactionOptions {
   inputs?: 'shield' | TransparentInput[];
   /** Required when spending transparent inputs (change must stay transparent). */
   transparentChangeAddress?: string;
+  /**
+   * Opt in to sweep semantics: allow the amount to consume the entire
+   * spendable balance, paying the fee out of the recipient's amount.
+   * Without this, an amount that leaves no room for the fee is rejected.
+   */
+  sweep?: boolean;
 }
 
 export interface BuiltTransaction {
@@ -85,4 +91,6 @@ export interface WalletState {
   diversifierIndex: number[];
   notes: SpendableNote[];
   nullifierMap: Record<string, { recipient: string; value: number }>;
+  /** txid → nullifiers for broadcast-but-unconfirmed spends. */
+  pendingSpends?: Record<string, string[]>;
 }

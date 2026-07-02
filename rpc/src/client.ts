@@ -21,6 +21,8 @@ export interface PivxClientOptions {
   wallet?: string;
   /** Request timeout in milliseconds. Default 30000. */
   timeoutMs?: number;
+  /** Reject responses whose Content-Length exceeds this. Default 64 MiB. */
+  maxResponseBytes?: number;
 }
 
 /** Error returned by the node's JSON-RPC layer (has the node's error code). */
@@ -41,6 +43,7 @@ export class PivxClient {
   private readonly url: string;
   private readonly authHeader?: string;
   private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
 
   constructor(opts: PivxClientOptions = {}) {
     const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
@@ -49,6 +52,8 @@ export class PivxClient {
       this.authHeader = 'Basic ' + Buffer.from(`${opts.user}:${opts.pass ?? ''}`).toString('base64');
     }
     this.timeoutMs = opts.timeoutMs ?? 30000;
+    // Big enough for a full verbosity-2 block; blocks getblock spam only.
+    this.maxResponseBytes = opts.maxResponseBytes ?? 64 * 1024 * 1024;
   }
 
   /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
@@ -63,6 +68,14 @@ export class PivxClient {
       body: JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+    // Refuse an implausibly large body before buffering it into memory: an
+    // untrusted node otherwise has an easy OOM. ponytail: checks the declared
+    // Content-Length only; a chunked response without one still buffers via
+    // res.json() — tighten with a streaming reader if that becomes a vector.
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > this.maxResponseBytes) {
+      throw new Error(`${method}: response too large (${declared} bytes)`);
+    }
     let body: { result?: T; error?: { code: number; message: string } | null };
     try {
       body = await res.json() as typeof body;

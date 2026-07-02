@@ -106,7 +106,12 @@ export class ShieldWatcher extends EventEmitter {
       this.primed = true;
       this.emit('block', hash);
     } catch (err) {
-      this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      // EventEmitter throws if 'error' is emitted with no listener. A poller
+      // must not crash the process on a transient RPC blip, so only emit
+      // when someone is listening; otherwise swallow (the next poll retries).
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      }
     } finally {
       this.polling = false;
     }

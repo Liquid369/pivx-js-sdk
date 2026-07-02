@@ -40,6 +40,12 @@ export class ScanDivergedError extends Error {
 /** Reverse hex byte order (node displays sapling roots like txids, byte-reversed). */
 const reverseHex = (hex: string) => (hex.match(/../g) ?? []).reverse().join('');
 
+/** Guard the money path against non-numeric note values from tampered state. */
+const assertSats = (v: unknown): number => {
+  if (!Number.isSafeInteger(v)) throw new Error(`note value is not a valid satoshi amount: ${v}`);
+  return v as number;
+};
+
 /**
  * Standalone PIVX wallet: owns keys, scans blocks, tracks shielded notes,
  * and builds fully-proved transactions locally. A node (via `pivx-rpc`) is
@@ -54,9 +60,12 @@ export class PivxWallet {
   private extsk?: string;
   private notes: SpendableNote[] = [];
   private nullifierMap = new Map<string, { recipient: string; value: number }>();
-  /** txid → nullifiers awaiting broadcast confirmation. */
+  /** txid → nullifiers awaiting broadcast confirmation. Persisted, so a
+   * crash between broadcast and finalize can't resurrect spent notes. */
   private pendingSpends = new Map<string, string[]>();
   private diversifierIndex: number[];
+  /** One writer at a time: block state-mutating operations from racing. */
+  private busy = false;
 
   private constructor(
     private readonly shield: Shield,
@@ -155,7 +164,15 @@ export class PivxWallet {
     const pending = new Set([...this.pendingSpends.values()].flat());
     return this.notes
       .filter((n) => !pending.has(n.nullifier))
-      .reduce((sum, n) => sum + n.note.value, 0);
+      .reduce((sum, n) => sum + assertSats(n.note.value), 0);
+  }
+
+  /** Sum of notes available to spend right now (excludes pending spends). */
+  private spendableTotal(): number {
+    const pending = new Set([...this.pendingSpends.values()].flat());
+    return this.notes
+      .filter((n) => !pending.has(n.nullifier))
+      .reduce((sum, n) => sum + assertSats(n.note.value), 0);
   }
 
   /** Currently tracked unspent notes. */
@@ -220,7 +237,12 @@ export class PivxWallet {
 
   /**
    * Decrypt a single transaction's outputs for this wallet without touching
-   * wallet state — e.g. 0-conf payment detection from the mempool.
+   * wallet state — a hint for 0-conf payment detection from the mempool.
+   *
+   * This only trial-decrypts; it does NOT validate the transaction (proof,
+   * double-spend, or whether it will ever confirm). Do not credit funds
+   * from a preview: dedupe on the caller's own txid and credit only from
+   * confirmed notes returned by {@link getNotes} after {@link sync}.
    */
   previewTransaction(hex: string): { recipient: string; value: number; memo?: string | null }[] {
     const result = this.shield.handle_blocks(
@@ -242,33 +264,85 @@ export class PivxWallet {
    * against the node's `finalsaplingroot` each batch.
    */
   async sync(client: PivxClient, opts: SyncOptions = {}): Promise<void> {
-    const batchSize = opts.batchSize ?? 100;
-    const tip = await client.getBlockCount();
-    while (this.lastProcessedBlock < tip) {
-      const from = this.lastProcessedBlock + 1;
-      const to = Math.min(from + batchSize - 1, tip);
-      const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
-      const blocks = await Promise.all(
-        heights.map(async (h) => {
-          const hash = await client.getBlockHash(h);
-          return client.getBlock(hash, 2) as Promise<{
-            height: number;
-            finalsaplingroot?: string;
-            tx: { hex: string; txid: string }[];
-          }>;
-        }),
-      );
-      this.handleBlocks(
-        blocks.map((b) => ({ height: b.height, txs: b.tx.map(({ hex, txid }) => ({ hex, txid })) })),
-      );
+    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    this.busy = true;
+    try {
+      const batchSize = opts.batchSize ?? 100;
+      const tip = await client.getBlockCount();
+      while (this.lastProcessedBlock < tip) {
+        const from = this.lastProcessedBlock + 1;
+        const to = Math.min(from + batchSize - 1, tip);
+        const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
+        const blocks = await Promise.all(
+          heights.map(async (h) => {
+            const hash = await client.getBlockHash(h);
+            const block = (await client.getBlock(hash, 2)) as {
+              height: number;
+              finalsaplingroot?: string;
+              tx: { hex: string; txid: string }[];
+            };
+            // Trust the height we asked for, not the one the node echoes,
+            // and reject a mismatch outright — otherwise a lying node can
+            // fast-forward lastProcessedBlock past real deposits.
+            if (block.height !== h) {
+              throw new Error(`node returned block height ${block.height} for requested height ${h}`);
+            }
+            return block;
+          }),
+        );
 
-      const nodeRoot = blocks[blocks.length - 1].finalsaplingroot;
-      if (nodeRoot) {
-        const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
-        if (localRoot !== nodeRoot) throw new ScanDivergedError(to, localRoot, nodeRoot);
+        // Snapshot so a failed root check can't leave partial state behind.
+        const snapshot = {
+          tree: this.commitmentTree,
+          last: this.lastProcessedBlock,
+          notes: this.notes,
+          nmap: new Map(this.nullifierMap),
+        };
+        try {
+          this.handleBlocks(
+            heights.map((h, i) => ({
+              height: h,
+              txs: blocks[i].tx.map(({ hex, txid }) => ({ hex, txid })),
+            })),
+          );
+
+          const nodeRoot = blocks[blocks.length - 1].finalsaplingroot;
+          // A shielded chain always has a sapling root; a missing one means
+          // the node is pre-activation or lying. Either way, refuse to
+          // advance unverified.
+          if (!nodeRoot) throw new Error(`node omitted finalsaplingroot at height ${to}`);
+          const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
+          if (localRoot !== nodeRoot) throw new ScanDivergedError(to, localRoot, nodeRoot);
+        } catch (err) {
+          this.commitmentTree = snapshot.tree;
+          this.lastProcessedBlock = snapshot.last;
+          this.notes = snapshot.notes;
+          this.nullifierMap = snapshot.nmap;
+          throw err;
+        }
+        opts.onProgress?.(to, tip);
       }
-      opts.onProgress?.(to, tip);
+    } finally {
+      this.busy = false;
     }
+  }
+
+  /**
+   * Reset scan state to the checkpoint at or below `height` and drop all
+   * tracked notes. The documented recovery from {@link ScanDivergedError}:
+   * call this, then {@link sync}. Requires no keys.
+   */
+  reloadFromCheckpoint(height: number): void {
+    if (this.busy) throw new Error('wallet is busy');
+    const [cpHeight, cpTree] = this.shield.get_closest_checkpoint(height, this.isTestnet) as [
+      number,
+      string,
+    ];
+    this.commitmentTree = cpTree;
+    this.lastProcessedBlock = cpHeight;
+    this.notes = [];
+    this.nullifierMap = new Map();
+    this.pendingSpends = new Map();
   }
 
   // ── Spending ──────────────────────────────────────────────────────────────
@@ -301,6 +375,12 @@ export class PivxWallet {
    */
   async createTransaction(opts: CreateTransactionOptions): Promise<BuiltTransaction> {
     if (!this.extsk) throw new NoSpendAuthorityError();
+    if (!Number.isSafeInteger(opts.amount) || opts.amount <= 0) {
+      throw new Error('amount must be a positive integer number of satoshis');
+    }
+    if (opts.memo !== undefined && Buffer.byteLength(opts.memo, 'utf8') > 512) {
+      throw new Error('memo must be at most 512 bytes');
+    }
     if (!(await this.shield.prover_is_loaded())) {
       throw new Error('sapling prover not loaded: call loadProver() first');
     }
@@ -308,23 +388,40 @@ export class PivxWallet {
     if (!useShield && !opts.transparentChangeAddress) {
       throw new Error('transparentChangeAddress is required when spending transparent inputs');
     }
-    const pending = new Set([...this.pendingSpends.values()].flat());
-    const changeAddress = useShield ? this.getNewAddress() : opts.transparentChangeAddress!;
+    // Send-max footgun: when the amount consumes the whole spendable balance
+    // the underlying library silently pays the fee out of the RECIPIENT's
+    // amount. Refuse unless the caller opts into sweep semantics. (Amounts
+    // within one fee of the balance can still trip this inside the WASM; see
+    // docs/usage.md — leave fee headroom for exact payouts.)
+    if (useShield && !opts.sweep && opts.amount >= this.spendableTotal()) {
+      throw new Error(
+        'amount consumes the entire spendable balance; leave headroom for the fee ' +
+          'or pass sweep:true to deduct the fee from the recipient',
+      );
+    }
+    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    this.busy = true;
+    try {
+      const pending = new Set([...this.pendingSpends.values()].flat());
+      const changeAddress = useShield ? this.getNewAddress() : opts.transparentChangeAddress!;
 
-    const result = (await this.shield.create_transaction({
-      notes: useShield ? this.notes.filter((n) => !pending.has(n.nullifier)) : null,
-      utxos: useShield ? null : (opts.inputs as TransparentInput[]),
-      extsk: this.extsk,
-      to_address: opts.to,
-      change_address: changeAddress,
-      amount: opts.amount,
-      block_height: this.lastProcessedBlock + 1,
-      is_testnet: this.isTestnet,
-      memo: opts.memo ?? '',
-    })) as { txid: string; txhex: string; nullifiers: string[] };
+      const result = (await this.shield.create_transaction({
+        notes: useShield ? this.notes.filter((n) => !pending.has(n.nullifier)) : null,
+        utxos: useShield ? null : (opts.inputs as TransparentInput[]),
+        extsk: this.extsk,
+        to_address: opts.to,
+        change_address: changeAddress,
+        amount: opts.amount,
+        block_height: this.lastProcessedBlock + 1,
+        is_testnet: this.isTestnet,
+        memo: opts.memo ?? '',
+      })) as { txid: string; txhex: string; nullifiers: string[] };
 
-    if (useShield) this.pendingSpends.set(result.txid, result.nullifiers);
-    return { txid: result.txid, hex: result.txhex, nullifiers: result.nullifiers };
+      if (useShield) this.pendingSpends.set(result.txid, result.nullifiers);
+      return { txid: result.txid, hex: result.txhex, nullifiers: result.nullifiers };
+    } finally {
+      this.busy = false;
+    }
   }
 
   /** Build, broadcast, and finalize in one step. */
@@ -371,14 +468,33 @@ export class PivxWallet {
       diversifierIndex: this.diversifierIndex,
       notes: this.notes,
       nullifierMap: Object.fromEntries(this.nullifierMap),
+      pendingSpends: Object.fromEntries(this.pendingSpends),
     };
     return JSON.stringify(state);
   }
 
   static async load(json: string): Promise<PivxWallet> {
-    const state = JSON.parse(json) as WalletState;
-    if (state.version !== 1) {
-      throw new Error(`unsupported wallet state version ${state.version}`);
+    let state: WalletState;
+    try {
+      state = JSON.parse(json) as WalletState;
+    } catch {
+      throw new Error('wallet state is not valid JSON');
+    }
+    if (state === null || typeof state !== 'object') throw new Error('wallet state is not an object');
+    if (state.version !== 1) throw new Error(`unsupported wallet state version ${state.version}`);
+    if (state.network !== 'mainnet' && state.network !== 'testnet') {
+      throw new Error('wallet state has an invalid network');
+    }
+    if (typeof state.extfvk !== 'string' || typeof state.commitmentTree !== 'string') {
+      throw new Error('wallet state is missing keys or commitment tree');
+    }
+    if (!Number.isSafeInteger(state.lastProcessedBlock) || !Array.isArray(state.notes)) {
+      throw new Error('wallet state has an invalid sync position or notes');
+    }
+    for (const n of state.notes) {
+      if (typeof n?.nullifier !== 'string' || !Number.isSafeInteger(n?.note?.value)) {
+        throw new Error('wallet state contains a malformed note');
+      }
     }
     const shield = await loadShield();
     const wallet = new PivxWallet(
@@ -390,7 +506,8 @@ export class PivxWallet {
       state.diversifierIndex,
     );
     wallet.notes = state.notes;
-    wallet.nullifierMap = new Map(Object.entries(state.nullifierMap));
+    wallet.nullifierMap = new Map(Object.entries(state.nullifierMap ?? {}));
+    wallet.pendingSpends = new Map(Object.entries(state.pendingSpends ?? {}));
     return wallet;
   }
 
