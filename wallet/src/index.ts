@@ -16,6 +16,12 @@ export {
   type TxInput,
   type TxOutput,
 } from './transparent-tx.js';
+export {
+  TransparentWallet,
+  type OwnedUtxo,
+  type ScannedOutput,
+  type ScannedInput,
+} from './transparent-wallet.js';
 export type { ProvingOptions } from './shield-bindings.js';
 export type {
   SpendableNote,
