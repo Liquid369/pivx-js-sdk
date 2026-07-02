@@ -1,6 +1,10 @@
 // Fully standalone shielded send: keys and proving live in this process;
 // the node only supplies blocks and relays the final transaction.
 // Usage: node send-standalone.mjs <extended-spending-key> <birth-height> <to-address> <piv-amount>
+//
+// Note: proving on a single WASM thread (the default in Node) is slow. For
+// server-side signing use the Rust SDK's native proving; in a browser enable
+// multicore. See docs/deployment.md.
 import { PivxClient } from 'pivx-rpc';
 import { PivxWallet } from 'pivx-wallet';
 

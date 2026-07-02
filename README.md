@@ -30,6 +30,7 @@ Examples: [`wallet/examples/`](wallet/examples/) (deposit watcher,
 standalone send), [`rpc/examples/`](rpc/examples/) (node-wallet flows).
 
 Full usage guide: [docs/usage.md](docs/usage.md).
+Feature list: [docs/FEATURES.md](docs/FEATURES.md). Deployment + safety: [docs/deployment.md](docs/deployment.md), [SECURITY.md](SECURITY.md).
 
 ## Develop
 
