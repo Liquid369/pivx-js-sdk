@@ -43,6 +43,12 @@ export interface CreateWalletOptions {
   birthHeight: number;
   /** ZIP32 account index under the seed. Default 0. */
   accountIndex?: number;
+  /**
+   * Proving backend. Defaults to single-core WASM. Set `multicore: true` to
+   * use the parallel WASM build (browser only, needs cross-origin isolation).
+   * For server-side proving, use the native Rust SDK instead.
+   */
+  proving?: import('./shield-bindings.js').ProvingOptions;
 }
 
 export interface CreateTransactionOptions {

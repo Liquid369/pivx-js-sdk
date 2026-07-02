@@ -34,6 +34,9 @@
     "pivx-rpc": "^0.1.0",
     "pivx-shield-rust": "^1.4.0"
   },
+  "optionalDependencies": {
+    "pivx-shield-rust-multicore": "^1.4.0"
+  },
   "devDependencies": {
     "@types/node": "^26.1.0",
     "typescript": "^5.5.0"

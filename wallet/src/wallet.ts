@@ -1,5 +1,5 @@
 import type { PivxClient } from 'pivx-rpc';
-import { loadShield, type Shield } from './shield-bindings.js';
+import { loadShield, type ProvingOptions, type Shield } from './shield-bindings.js';
 import type {
   BuiltTransaction,
   CreateTransactionOptions,
@@ -104,7 +104,7 @@ export class PivxWallet {
     if (provided.length !== 1) {
       throw new Error('provide exactly one of: seed, spendingKey, viewingKey');
     }
-    const shield = await loadShield();
+    const shield = await loadShield(opts.proving);
     const isTestnet = network === 'testnet';
 
     let extsk: string | undefined;
@@ -545,7 +545,7 @@ export class PivxWallet {
     return JSON.stringify(state);
   }
 
-  static async load(json: string): Promise<PivxWallet> {
+  static async load(json: string, proving?: ProvingOptions): Promise<PivxWallet> {
     let state: WalletState;
     try {
       state = JSON.parse(json) as WalletState;
@@ -568,7 +568,7 @@ export class PivxWallet {
         throw new Error('wallet state contains a malformed note');
       }
     }
-    const shield = await loadShield();
+    const shield = await loadShield(proving);
     const wallet = new PivxWallet(
       shield,
       state.network,
