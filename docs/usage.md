@@ -8,7 +8,7 @@ deposits (see [Trust model](#trust-model) and `SECURITY.md`). Most
 integrations want `pivx-wallet`; use `pivx-rpc` alone when the node's
 built-in wallet already does what you need.
 
-Node 18 or newer. Both packages are ESM.
+Node 20.19 or newer. Both packages are ESM.
 
 ```
 npm install pivx-rpc pivx-wallet
@@ -257,19 +257,18 @@ restored.loadSpendingKey(spendingKey);   // only where spending happens
 ```
 
 `save()` output contains the viewing key, sync position, commitment tree,
-and notes. It cannot spend, but it can see: anyone holding it can decrypt
-this wallet's transaction history. Store it with the same care as customer
-data. Store the spending key separately, encrypted, ideally on fewer hosts.
+notes, and pending spends. It cannot spend, but it can see: anyone holding
+it can decrypt this wallet's transaction history. Store it with the same
+care as customer data. Store the spending key separately, encrypted,
+ideally on fewer hosts.
 
-Save after every sync. Two things are deliberately not persisted:
-
-- Pending spends. If the process dies between `createTransaction` and
-  `finalizeTransaction`, a restored wallet believes the notes are still
-  spendable. A second send would double-spend notes already committed to an
-  in-flight transaction, and the network will reject it. After a crash,
-  wait until the in-flight txid confirms or is clearly gone, sync, then
-  resume sending.
-- The spending key, as above.
+Save after every sync and after every send. Pending spends are persisted:
+notes committed to a broadcast-but-unconfirmed transaction survive
+`save()`/`load()`, so a crash between broadcast and finalize cannot
+resurrect them into a double-spend — provided the state you restore was
+saved after the send. After a crash, wait for the in-flight txid to
+confirm or clearly disappear, sync, then resume sending. The spending key
+is never persisted, as above.
 
 The state format is versioned JSON, identical across the JS and Rust SDKs.
 
@@ -302,17 +301,24 @@ try {
   await client.sendRawTransaction(tx.hex);
   wallet.finalizeTransaction(tx.txid);
 } catch (e) {
-  wallet.discardTransaction(tx.txid);   // notes become spendable again
+  // Discard only when the node definitively rejected the transaction.
+  if (e instanceof RpcError) wallet.discardTransaction(tx.txid);
   throw e;
 }
 ```
 
+Discard only on `RpcError` (a definitive node rejection): a transport or
+timeout failure is ambiguous — the node may have accepted the transaction —
+so the notes must stay pending until the txid confirms or clearly
+disappears, or a retry could double-spend them.
+
 Fee behavior to know before wiring withdrawals: the fee is size-based
 (1000 sats/byte over a fixed model; a typical 1-in-2-out shield spend pays
 about 0.024 PIV). When the wallet's funds cover the amount but not
-amount + fee, the fee is deducted from the recipient's amount rather than
-failing. For exact payouts, keep a fee margin above the requested amount
-and treat balance-emptying sends as "sweep" semantics.
+amount + fee, the send is rejected rather than silently underpaying the
+recipient. To empty a wallet, opt in with `sweep: true`, which deducts the
+fee from the recipient's amount instead. For exact payouts, keep fee
+headroom above the requested amount.
 
 Notes selected into a transaction are excluded from `getBalance()` until
 you finalize or discard. Change returns to a fresh address of this wallet

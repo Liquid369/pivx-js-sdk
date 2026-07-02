@@ -100,3 +100,14 @@ test('scanBlock skips malformed vouts instead of poisoning balance', () => {
   });
   assert.equal(w.balance(), 300_000_000); // only the valid vout credited, no NaN
 });
+
+test('sync with batchSize 0 terminates (clamped to 1)', async () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(8), 'mainnet', 0, 5);
+  const client = {
+    getBlockCount: async () => 3,
+    getBlockHash: async (h) => `hash:${h}`,
+    getBlock: async (hash) => ({ height: Number(hash.split(':')[1]), tx: [] }),
+  };
+  await w.sync(client, { batchSize: 0 }); // used to loop forever (from = to + 1 with to = from - 1)
+  assert.equal(w.lastScannedBlock(), 3);
+});

@@ -49,7 +49,12 @@ export class PivxClient {
     const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
     this.url = opts.wallet ? `${base.replace(/\/$/, '')}/wallet/${opts.wallet}` : base;
     if (opts.user !== undefined) {
-      this.authHeader = 'Basic ' + Buffer.from(`${opts.user}:${opts.pass ?? ''}`).toString('base64');
+      // Runtime-agnostic base64 of the UTF-8 credential bytes (no Buffer, so
+      // browser bundles work; btoa exists in Node >= 16 and all browsers).
+      const bytes = new TextEncoder().encode(`${opts.user}:${opts.pass ?? ''}`);
+      let bin = '';
+      for (const b of bytes) bin += String.fromCharCode(b);
+      this.authHeader = 'Basic ' + btoa(bin);
     }
     this.timeoutMs = opts.timeoutMs ?? 30000;
     // Big enough for a full verbosity-2 block; blocks getblock spam only.

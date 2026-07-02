@@ -365,7 +365,8 @@ export class PivxWallet {
     if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
     this.busy = true;
     try {
-      const batchSize = opts.batchSize ?? 100;
+      // NaN/0/fractional → sane integer; 0 would loop forever.
+      const batchSize = Math.max(1, Math.floor(opts.batchSize ?? 100) || 1);
       // getblock verbosity 2 is heavy. A default node has 4 RPC threads and a
       // work queue of 16, so firing a whole batch at once gets 500s. Keep the
       // concurrent fetches well under that.
@@ -558,7 +559,7 @@ export class PivxWallet {
     if (!Number.isSafeInteger(opts.amount) || opts.amount <= 0) {
       throw new Error('amount must be a positive integer number of satoshis');
     }
-    if (opts.memo !== undefined && Buffer.byteLength(opts.memo, 'utf8') > 512) {
+    if (opts.memo !== undefined && new TextEncoder().encode(opts.memo).length > 512) {
       throw new Error('memo must be at most 512 bytes');
     }
     const useShield = opts.inputs === undefined || opts.inputs === 'shield';

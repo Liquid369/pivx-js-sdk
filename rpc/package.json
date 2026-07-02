@@ -22,8 +22,9 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "engines": {
-    "node": ">=18"
+    "node": ">=20.19.0"
   },
   "scripts": {
     "build": "tsc",

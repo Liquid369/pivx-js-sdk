@@ -1,7 +1,8 @@
 # PIVX JS SDK
 
 JavaScript SDK for the [PIVX](https://pivx.org) blockchain with first-class
-shielded (SHIELD/Sapling) support. Node ≥ 18 and browsers.
+shielded (SHIELD/Sapling) support. Node ≥ 20.19; browser-compatible (bundler
+required for WASM; multicore proving needs cross-origin isolation).
 
 | Package | What it does |
 |---|---|

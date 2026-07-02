@@ -1,4 +1,3 @@
-import { EventEmitter } from 'node:events';
 import type { PivxClient } from './client.js';
 import type { ShieldNote } from './types.js';
 
@@ -25,10 +24,51 @@ export interface ShieldWatcherEvents {
   error: (err: Error) => void;
 }
 
-export declare interface ShieldWatcher {
-  on<E extends keyof ShieldWatcherEvents>(event: E, listener: ShieldWatcherEvents[E]): this;
-  once<E extends keyof ShieldWatcherEvents>(event: E, listener: ShieldWatcherEvents[E]): this;
-  emit<E extends keyof ShieldWatcherEvents>(event: E, ...args: Parameters<ShieldWatcherEvents[E]>): boolean;
+/**
+ * Minimal typed event emitter (the subset of node:events the watcher needs)
+ * so importing this package does not pull in Node built-ins — browser
+ * bundlers can consume it as-is. Unlike node's EventEmitter it never throws
+ * on an unhandled 'error' event.
+ */
+class Emitter<Events extends { [E in keyof Events]: (...args: never[]) => void }> {
+  private listeners = new Map<keyof Events, Events[keyof Events][]>();
+
+  on<E extends keyof Events>(event: E, listener: Events[E]): this {
+    const list = this.listeners.get(event);
+    if (list) list.push(listener);
+    else this.listeners.set(event, [listener]);
+    return this;
+  }
+
+  once<E extends keyof Events>(event: E, listener: Events[E]): this {
+    const wrap = ((...args: Parameters<Events[E]>) => {
+      this.off(event, wrap);
+      (listener as (...a: Parameters<Events[E]>) => void)(...args);
+    }) as Events[E];
+    // Back-reference so off(listener) also removes a once(listener)
+    // registration, matching node's EventEmitter.
+    (wrap as { listener?: Events[E] }).listener = listener;
+    return this.on(event, wrap);
+  }
+
+  off<E extends keyof Events>(event: E, listener: Events[E]): this {
+    const list = this.listeners.get(event);
+    const i =
+      list?.findIndex((l) => l === listener || (l as { listener?: Events[E] }).listener === listener) ?? -1;
+    if (list && i >= 0) list.splice(i, 1);
+    return this;
+  }
+
+  emit<E extends keyof Events>(event: E, ...args: Parameters<Events[E]>): boolean {
+    const list = this.listeners.get(event);
+    if (!list || list.length === 0) return false;
+    for (const l of [...list]) (l as (...a: Parameters<Events[E]>) => void)(...args);
+    return true;
+  }
+
+  listenerCount(event: keyof Events): number {
+    return this.listeners.get(event)?.length ?? 0;
+  }
 }
 
 const noteKey = (n: ShieldNote) => `${n.txid}:${n.outindex}`;
@@ -41,7 +81,7 @@ const noteKey = (n: ShieldNote) => `${n.txid}:${n.outindex}`;
  * imported, spends cannot be detected, so `spent` events and balance
  * decreases only fire for addresses whose spending key is in the wallet.
  */
-export class ShieldWatcher extends EventEmitter {
+export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
   private notes = new Map<string, ShieldNote>();
   private lastHash = '';
   private lastBalance = NaN;
@@ -106,9 +146,9 @@ export class ShieldWatcher extends EventEmitter {
       this.primed = true;
       this.emit('block', hash);
     } catch (err) {
-      // EventEmitter throws if 'error' is emitted with no listener. A poller
-      // must not crash the process on a transient RPC blip, so only emit
-      // when someone is listening; otherwise swallow (the next poll retries).
+      // A poller must not crash the process on a transient RPC blip, so only
+      // emit when someone is listening; otherwise swallow (the next poll
+      // retries).
       if (this.listenerCount('error') > 0) {
         this.emit('error', err instanceof Error ? err : new Error(String(err)));
       }

@@ -191,9 +191,12 @@ export class TransparentWallet {
     const concurrency = 8;
     const tip = await client.getBlockCount();
     const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
+    // NaN/0/fractional → sane integer: 0 would loop forever and fractional
+    // heights would skip blocks (matches Rust batch.max(1)).
+    const batch = Math.max(1, Math.floor(batchSize) || 1);
     let from = Math.max(fromHeight, this.lastScanned + 1);
     while (from <= tip) {
-      const to = Math.min(from + batchSize - 1, tip);
+      const to = Math.min(from + batch - 1, tip);
       const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
       for (let i = 0; i < heights.length; i += concurrency) {
         const blocks = await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock));
