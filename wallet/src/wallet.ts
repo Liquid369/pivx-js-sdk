@@ -397,11 +397,13 @@ export class PivxWallet {
         }
 
         // Snapshot so a failed root check can't leave partial state behind.
+        // Includes pendingSpends because applyBlocks reconciles it.
         const snapshot = {
           tree: this.commitmentTree,
           last: this.lastProcessedBlock,
           notes: this.notes,
           nmap: new Map(this.nullifierMap),
+          pending: new Map(this.pendingSpends),
         };
         try {
           this.applyBlocks(
@@ -423,6 +425,7 @@ export class PivxWallet {
           this.lastProcessedBlock = snapshot.last;
           this.notes = snapshot.notes;
           this.nullifierMap = snapshot.nmap;
+          this.pendingSpends = snapshot.pending;
           throw err;
         }
         opts.onProgress?.(to, tip);
