@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "PIVX SDK: typed JSON-RPC client with shielded (SHIELD/Sapling) balance watching and transaction support",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liquid369/pivx-js-sdk.git",
+    "directory": "rpc"
+  },
+  "homepage": "https://github.com/Liquid369/pivx-js-sdk#readme",
+  "bugs": "https://github.com/Liquid369/pivx-js-sdk/issues",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

@@ -3,6 +3,13 @@
   "version": "0.1.0",
   "description": "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Liquid369/pivx-js-sdk.git",
+    "directory": "wallet"
+  },
+  "homepage": "https://github.com/Liquid369/pivx-js-sdk#readme",
+  "bugs": "https://github.com/Liquid369/pivx-js-sdk/issues",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

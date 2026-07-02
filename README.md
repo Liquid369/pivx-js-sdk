@@ -11,7 +11,7 @@ shielded (SHIELD/Sapling) support. Node ≥ 18 and browsers.
 A wallet is constructed from a seed, spending key, **or viewing key** —
 watch-only is a capability level (scan/receive/balance, no spend),
 upgradeable in place. Wallet state JSON is interchangeable with the
-[Rust SDK](https://github.com/PIVX-Project/pivx-rust-sdk).
+[Rust SDK](https://github.com/Liquid369/pivx-rust-sdk).
 
 ```js
 import { PivxClient } from 'pivx-rpc';
