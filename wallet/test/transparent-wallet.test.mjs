@@ -56,3 +56,47 @@ test('insufficient balance throws', () => {
   w.addUtxo('cc'.repeat(32), 0, 1000, scriptPubKeyForAddress(a0.address));
   assert.throws(() => w.buildSend(a0.address, 100_000_000, 100), /insufficient/);
 });
+
+test('rejects wrong-network destination, dust amount, and bad fee', () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(5), 'mainnet', 0, 5);
+  const a0 = deriveKey(new Uint8Array(32).fill(5), 'mainnet', 0, 0, 0);
+  w.addUtxo('cc'.repeat(32), 0, 200_000_000, scriptPubKeyForAddress(a0.address));
+  const testnetDest = p2pkhAddress(a0.publicKey, 'testnet');
+  assert.throws(() => w.buildSend(testnetDest, 100_000_000, 100), /different network/);
+  assert.throws(() => w.buildSend(a0.address, 5000, 100), /dust/);        // < 5460 sats
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, -1), /feePerByte/);
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 100));
+});
+
+test('immature coinbase is not spendable until mature', () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(6), 'mainnet', 0, 5);
+  const a0 = deriveKey(new Uint8Array(32).fill(6), 'mainnet', 0, 0, 0);
+  const spkHex = [...scriptPubKeyForAddress(a0.address)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  w.scanBlock({
+    height: 100,
+    tx: [{ txid: 'dd'.repeat(32), vin: [{ coinbase: '00' }], vout: [{ n: 0, value: 5.0, scriptPubKey: { hex: spkHex } }] }],
+  });
+  assert.equal(w.balance(), 500_000_000);
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, 100), /insufficient/); // 1 confirmation
+  w.scanBlock({ height: 199, tx: [] }); // 100 confirmations => mature
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 100));
+});
+
+test('scanBlock skips malformed vouts instead of poisoning balance', () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(7), 'mainnet', 0, 5);
+  const a0 = deriveKey(new Uint8Array(32).fill(7), 'mainnet', 0, 0, 0);
+  const spkHex = [...scriptPubKeyForAddress(a0.address)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  w.scanBlock({
+    height: 10,
+    tx: [{
+      txid: 'ee'.repeat(32),
+      vin: [{ coinbase: '00' }],
+      vout: [
+        { n: 0 },                                                    // missing value + script
+        { n: 1, value: 2.0, scriptPubKey: {} },                      // missing hex
+        { n: 2, value: 3.0, scriptPubKey: { hex: spkHex } },         // valid, ours
+      ],
+    }],
+  });
+  assert.equal(w.balance(), 300_000_000); // only the valid vout credited, no NaN
+});

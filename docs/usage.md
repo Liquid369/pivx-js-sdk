@@ -56,20 +56,22 @@ tunnel the connection; do not expose the RPC port.
 
 ### Calling the node
 
-Typed methods cover the blockchain, wallet, and shield surface:
+Typed methods cover the blockchain, wallet, shield, masternode, staking,
+budget, and network surface:
 
 ```js
 const height = await client.getBlockCount();
 const balance = await client.getShieldBalance();          // all shield funds, PIV
-const notes = await client.listShieldUnspent(1);           // unspent shield notes
+const mnCount = await client.getMasternodeCount();         // masternode count
+const fee = await client.estimateSmartFee(6);              // smart fee estimate
 const addr = await client.getNewShieldAddress();
 ```
 
-Anything not covered goes through `call`, which takes the method name and
-positional params exactly as `pivx-cli` would:
+Anything still not wrapped goes through `call`, which takes the method name
+and positional params exactly as `pivx-cli` would:
 
 ```js
-const info = await client.call('getmasternodecount');
+const tips = await client.call('getchaintips');
 ```
 
 Node errors throw `RpcError` with the node's own `code` and message.
@@ -346,3 +348,79 @@ Unit-test against fixtures the way this repo's own tests do
 (`wallet/test/`). For end-to-end validation run a regtest node, mine past
 the sapling activation height, and drive real deposits and sends; nothing
 else exercises consensus acceptance of locally-built transactions.
+
+## Transparent wallet
+
+`pivx-wallet` also manages PIVX's transparent (non-shielded, UTXO) funds,
+separately from the shield wallet. Transparent sends are plain ECDSA-signed
+legacy transactions — no proving parameters. Amounts are integer satoshis,
+same as the shield wallet.
+
+### Addressing
+
+```js
+import { deriveKey, p2pkhAddress, decodeAddress, isValidAddress } from 'pivx-wallet';
+
+// BIP44 m/44'/119'/account'/change/index — change 0 = receive, 1 = internal
+const key = deriveKey(seed, 'mainnet', 0, 0, 0);
+key.address;                    // 'D...'  (also key.publicKey, key.privateKey, key.wif)
+
+isValidAddress(key.address);    // true
+const { hash, kind, network } = decodeAddress(key.address);
+// kind: 'p2pkh' | 'p2sh' | 'staking' | 'exchange'
+```
+
+### Creating and receiving
+
+PIVX has no address index, so a transparent wallet learns about incoming
+coins two ways — scan the chain, or hand it UTXOs you already know about.
+
+```js
+import { TransparentWallet } from 'pivx-wallet';
+import { PivxClient } from 'pivx-rpc';
+
+const wallet = TransparentWallet.create(seed, 'mainnet', 0, 100);  // account 0, gap 100
+const addr = wallet.newAddress();     // fresh receive address per deposit
+
+// (a) scan the chain
+const client = new PivxClient({ user, pass });
+await wallet.sync(client, { fromHeight: 4_800_000, batchSize: 100 });
+// or feed one decoded block (getblock <hash> 2) from your own source:
+wallet.scanBlock(block);
+
+// (b) or register a UTXO yourself; returns false if it isn't ours
+wallet.addUtxo(txid, vout, 200_000_000, scriptPubKeyBytes);
+
+wallet.balance();   // sats
+wallet.getUtxos();  // tracked unspent outputs
+```
+
+### Sending
+
+```js
+const { hex, spent } = wallet.buildSend('D...recipient', 150_000_000, 100);  // 100 sats/byte
+await client.sendRawTransaction(hex);
+wallet.markSpent(spent);              // only after a successful broadcast
+```
+
+`buildSend` selects coins largest-first, signs locally (ECDSA), sizes the
+fee from `feePerByte` (default 100), and sends change to a fresh internal
+address. It throws if funds can't cover amount + fee rather than
+underpaying. Call `markSpent(spent)` only once the broadcast succeeds —
+until then the UTXOs stay spendable, so a failed broadcast can be retried.
+This send path is verified against real mainnet transactions.
+
+### Exchange addresses
+
+Exchange addresses (`EXM` mainnet, `EXT` testnet) are a receive-only
+transparent variant. Validate them and send to them like any address; the
+output carries an `OP_EXCHANGEADDR` prefix on an otherwise standard P2PKH
+script.
+
+```js
+isValidAddress('EXM...');             // true
+decodeAddress('EXM...').kind;         // 'exchange'
+const { hex, spent } = wallet.buildSend('EXM...', 150_000_000, 100);
+```
+
+Sending to a cold-staking address is rejected.

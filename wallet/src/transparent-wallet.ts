@@ -7,10 +7,22 @@
  * ({@link scan}) or supplied by the caller ({@link addUtxo}).
  */
 import type { PivxClient } from 'pivx-rpc';
-import { deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
+import { decodeAddress, deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
 import { buildTransparentTx, scriptPubKeyForAddress, type TxInput } from './transparent-tx.js';
 
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+
+/**
+ * PIVX dust threshold (sats) for an output whose scriptPubKey is `scriptLen`
+ * bytes. Matches `GetDustThreshold` in src/policy/policy.cpp: the output plus
+ * the 148-byte input to spend it, priced at dustRelayFee = 30000 sat/kB. For
+ * our scripts (< 253 bytes) the length prefix is one byte, so the serialized
+ * output is `8 + 1 + scriptLen`; a 25-byte P2PKH gives 5460.
+ */
+const dustThreshold = (scriptLen: number): number => Math.floor((30_000 * (8 + 1 + scriptLen + 148)) / 1000);
+
+/** Coinbase/coinstake maturity in blocks (nCoinbaseMaturity): mainnet 100, testnet 15. */
+const coinbaseMaturity = (network: Network): number => (network === 'mainnet' ? 100 : 15);
 
 /** A tracked unspent transparent output we can spend. */
 export interface OwnedUtxo {
@@ -19,6 +31,8 @@ export interface OwnedUtxo {
   amount: number;
   scriptPubKey: Uint8Array;
   keyHash: string; // hex hash160 of the controlling key
+  coinbase: boolean; // coinbase/coinstake output — spend-gated by maturity
+  height: number; // block height confirmed at (0 if caller-supplied)
 }
 
 export interface ScannedOutput {
@@ -90,11 +104,26 @@ export class TransparentWallet {
     return h;
   }
 
-  /** Add a caller-supplied UTXO if it pays one of our addresses. Returns true if ours. */
+  /**
+   * Add a caller-supplied UTXO if it pays one of our addresses. Returns true if
+   * ours. Assumed a normal (non-coinbase) spendable output; use {@link scanBlock}
+   * for chain data where coinbase maturity is tracked.
+   */
   addUtxo(txid: string, vout: number, amount: number, scriptPubKey: Uint8Array): boolean {
+    return this.insertUtxo(txid, vout, amount, scriptPubKey, false, 0);
+  }
+
+  private insertUtxo(
+    txid: string,
+    vout: number,
+    amount: number,
+    scriptPubKey: Uint8Array,
+    coinbase: boolean,
+    height: number,
+  ): boolean {
     const h = p2pkhHash(scriptPubKey);
     if (h && this.keys.has(h)) {
-      this.utxos.set(`${txid}:${vout}`, { txid, vout, amount, scriptPubKey, keyHash: h });
+      this.utxos.set(`${txid}:${vout}`, { txid, vout, amount, scriptPubKey, keyHash: h, coinbase, height });
       return true;
     }
     return false;
@@ -113,10 +142,23 @@ export class TransparentWallet {
    */
   scanBlock(block: any): void {
     if (typeof block.height === 'number') this.lastScanned = block.height;
+    const height = this.lastScanned;
     for (const tx of block.tx ?? []) {
+      if (typeof tx.txid !== 'string') continue;
+      // Coinbase: first vin carries `coinbase` and no prevout. Coinstake (PoS):
+      // a spending vin plus an empty vout[0] (zero value). Both are maturity-
+      // gated for spending (src/txmempool.cpp).
+      const firstVin = tx.vin?.[0];
+      const isCoinbase = firstVin?.coinbase !== undefined;
+      const isCoinstake = firstVin?.txid !== undefined && tx.vout?.[0]?.value === 0;
+      const coinbase = isCoinbase || isCoinstake;
       for (const o of tx.vout ?? []) {
-        const script = Uint8Array.from((o.scriptPubKey.hex.match(/../g) ?? []).map((b: string) => parseInt(b, 16)));
-        this.addUtxo(tx.txid, o.n, Math.round(o.value * 1e8), script);
+        const hexStr = o?.scriptPubKey?.hex;
+        // Skip malformed vouts rather than poisoning balance with NaN or
+        // throwing mid-sync (matches the Rust scanner).
+        if (typeof o?.n !== 'number' || typeof o?.value !== 'number' || typeof hexStr !== 'string') continue;
+        const script = Uint8Array.from((hexStr.match(/../g) ?? []).map((b: string) => parseInt(b, 16)));
+        this.insertUtxo(tx.txid, o.n, Math.round(o.value * 1e8), script, coinbase, height);
       }
       for (const i of tx.vin ?? []) {
         if (i.txid !== undefined) this.utxos.delete(`${i.txid}:${i.vout}`);
@@ -186,8 +228,23 @@ export class TransparentWallet {
     feePerByte = 100,
   ): { hex: string; spent: { txid: string; vout: number }[] } {
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('amount must be a positive integer (satoshis)');
+    if (!Number.isInteger(feePerByte) || feePerByte <= 0) throw new Error('feePerByte must be a positive integer (satoshis/byte)');
+    const dest = decodeAddress(to); // throws on an invalid address
+    // A mainnet wallet must not send to a testnet-encoded address (or vice
+    // versa): the hash would be spent to this network's equivalent — a silent
+    // loss. Reject the mismatch up front.
+    if (dest.network !== this.network) throw new Error('destination address is for a different network');
+    if (dest.kind === 'staking') throw new Error('sending to a cold-staking address is not supported');
+    // Reject a recipient amount the node would drop as dust.
+    const toScript = scriptPubKeyForAddress(to);
+    if (amount < dustThreshold(toScript.length)) throw new Error('amount is below the dust threshold');
     const feerate = feePerByte;
-    const avail = [...this.utxos.values()].sort((a, b) => b.amount - a.amount);
+    // Exclude immature coinbase/coinstake outputs: the node rejects a spend of
+    // one before nCoinbaseMaturity confirmations (depth vs. last scanned block).
+    const maturity = coinbaseMaturity(this.network);
+    const avail = [...this.utxos.values()]
+      .filter((u) => !(u.coinbase && this.lastScanned - u.height + 1 < maturity))
+      .sort((a, b) => b.amount - a.amount);
     const selected: OwnedUtxo[] = [];
     let total = 0;
     for (const u of avail) {
@@ -200,7 +257,10 @@ export class TransparentWallet {
     const changeVal = total - amount - fee;
 
     const outputs = [{ address: to, amount }];
-    if (changeVal > feerate * 148) {
+    // Emit change only above both floors: the node's fixed dust threshold (else
+    // the tx is rejected as dust) and the fee to later spend the change input.
+    // Change is always P2PKH (25-byte script).
+    if (changeVal > Math.max(feerate * 148, dustThreshold(25))) {
       const chAddr = encodeAddress(
         Uint8Array.from(this.nextChangeHash().match(/../g)!.map((b) => parseInt(b, 16))),
         this.network,
