@@ -85,6 +85,9 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
   private notes = new Map<string, ShieldNote>();
   private lastHash = '';
   private lastBalance = NaN;
+  /** Integer-satoshi mirror of lastBalance: change detection must not fire on
+   * FP noise in the PIV-float sum (0.1 + 0.2 !== 0.3). */
+  private lastBalanceSats = NaN;
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
   private primed = false;
@@ -138,10 +141,13 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
       this.notes = current;
 
       const balance = notes.reduce((sum, n) => sum + n.amount, 0);
-      if (this.primed && balance !== this.lastBalance) {
+      // Detect change on the true satoshi sum; the event payload stays PIV.
+      const balanceSats = notes.reduce((sum, n) => sum + Math.round(n.amount * 1e8), 0);
+      if (this.primed && balanceSats !== this.lastBalanceSats) {
         this.emit('balance', balance, this.lastBalance);
       }
       this.lastBalance = balance;
+      this.lastBalanceSats = balanceSats;
       this.lastHash = hash;
       this.primed = true;
       this.emit('block', hash);

@@ -1,6 +1,6 @@
 {
   "name": "pivx-wallet",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Standalone PIVX wallet SDK: local key management, shielded (SHIELD/Sapling) scanning, balances, and transaction building. The node is only a chain-data source.",
   "license": "MIT",
   "repository": {
@@ -44,7 +44,7 @@
     "@noble/hashes": "^2.2.0",
     "@scure/base": "^2.2.0",
     "@scure/bip32": "^2.2.0",
-    "pivx-rpc": "^0.1.0",
+    "pivx-rpc": "^0.2.0",
     "pivx-shield-rust": "^1.4.0"
   },
   "optionalDependencies": {

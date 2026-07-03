@@ -37,11 +37,26 @@ export class RpcError extends Error {
   }
 }
 
+/** HTTP-layer authentication failure (401/403 from the node). */
+export class AuthError extends Error {
+  constructor(
+    method: string,
+    public readonly status: number,
+  ) {
+    super(
+      `${method}: authentication failed (HTTP ${status}); check rpcuser/rpcpassword or the cookie file`,
+    );
+    this.name = 'AuthError';
+  }
+}
+
 let nextId = 0;
 
 export class PivxClient {
   private readonly url: string;
-  private readonly authHeader?: string;
+  private authHeader?: string;
+  /** Set when built via {@link fromCookie}; enables the 401 refresh-and-retry. */
+  private cookiePath?: string;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
 
@@ -49,30 +64,85 @@ export class PivxClient {
     const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
     this.url = opts.wallet ? `${base.replace(/\/$/, '')}/wallet/${opts.wallet}` : base;
     if (opts.user !== undefined) {
-      // Runtime-agnostic base64 of the UTF-8 credential bytes (no Buffer, so
-      // browser bundles work; btoa exists in Node >= 16 and all browsers).
-      const bytes = new TextEncoder().encode(`${opts.user}:${opts.pass ?? ''}`);
-      let bin = '';
-      for (const b of bytes) bin += String.fromCharCode(b);
-      this.authHeader = 'Basic ' + btoa(bin);
+      this.authHeader = PivxClient.basicAuth(opts.user, opts.pass ?? '');
     }
     this.timeoutMs = opts.timeoutMs ?? 30000;
     // Big enough for a full verbosity-2 block; blocks getblock spam only.
     this.maxResponseBytes = opts.maxResponseBytes ?? 64 * 1024 * 1024;
   }
 
-  /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
-  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
-    while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
-    const res = await fetch(this.url, {
+  /** Runtime-agnostic base64 of the UTF-8 credential bytes (no Buffer, so
+   * browser bundles work; btoa exists in Node >= 16 and all browsers). */
+  private static basicAuth(user: string, pass: string): string {
+    const bytes = new TextEncoder().encode(`${user}:${pass}`);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return 'Basic ' + btoa(bin);
+  }
+
+  /**
+   * Build a client authenticated by a pivxd `.cookie` file (written to the
+   * node's datadir on startup; a single `user:pass` line). Node-only: the
+   * file is read via a dynamic `node:fs` import that only executes here, so
+   * the package stays browser-importable.
+   *
+   * When a request later gets HTTP 401/403, the cookie file is re-read; if
+   * its credentials changed (pivxd rewrites the cookie on restart) the
+   * request is retried once, otherwise an {@link AuthError} is thrown.
+   */
+  static async fromCookie(
+    cookiePath: string,
+    opts: Omit<PivxClientOptions, 'user' | 'pass'> = {},
+  ): Promise<PivxClient> {
+    const client = new PivxClient(opts);
+    client.cookiePath = cookiePath;
+    client.authHeader = await PivxClient.readCookie(cookiePath);
+    return client;
+  }
+
+  /** Read and encode `.cookie` credentials. Splits on the FIRST colon only —
+   * passwords may contain colons. A real `.cookie` is `__cookie__:<hex>`, well
+   * under 4 KiB; a larger file is a wrong path, not a cookie. */
+  private static async readCookie(path: string): Promise<string> {
+    const { readFile } = await import('node:fs/promises');
+    const contents = await readFile(path, 'utf8');
+    if (contents.length > 4096) throw new Error(`cookie file ${path} is too large`);
+    const line = contents.trim();
+    const sep = line.indexOf(':');
+    if (sep < 0) throw new Error(`cookie file ${path} is not in user:pass format`);
+    return PivxClient.basicAuth(line.slice(0, sep), line.slice(sep + 1));
+  }
+
+  private post(body: string): Promise<Response> {
+    return fetch(this.url, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         ...(this.authHeader ? { authorization: this.authHeader } : {}),
       },
-      body: JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params }),
+      body,
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+  }
+
+  /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
+  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
+    while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
+    const payload = JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params });
+    let res = await this.post(payload);
+    // pivxd rewrites .cookie on restart: on 401, re-read it and retry once when
+    // the credentials actually changed (same contract as the Rust SDK). A 403
+    // is an IP/ACL denial a cookie can't fix, so it is not retried. An
+    // unreadable cookie counts as unchanged and falls through to AuthError.
+    if (res.status === 401 && this.cookiePath) {
+      const fresh = await PivxClient.readCookie(this.cookiePath).catch(() => undefined);
+      if (fresh !== undefined && fresh !== this.authHeader) {
+        this.authHeader = fresh;
+        await res.body?.cancel().catch(() => {});
+        res = await this.post(payload);
+      }
+    }
+    if (res.status === 401 || res.status === 403) throw new AuthError(method, res.status);
     // Read the body with a hard byte cap so a hostile node can't exhaust
     // memory. Streaming means the cap holds even without a Content-Length.
     const raw = await this.readCapped(res, method);

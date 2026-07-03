@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-03
+
+### Added
+
+- `pivx-wallet`: `pruneNullifiers()` — opt-in, drops nullifier-attribution
+  entries for notes that are neither tracked-unspent nor pending; call after
+  reconciling. Bounds state growth under a dust flood (sub-dust notes, ≤ 384000
+  sats, are also skipped in attribution and purged from tracked state).
+- `pivx-wallet`: `signal?: AbortSignal` on `PivxWallet.sync` and
+  `TransparentWallet.sync` — aborting throws at a batch boundary with state left
+  consistent and the busy guard released.
+- `pivx-rpc`: `PivxClient.fromCookie(path)` — cookie-file auth; on HTTP 401 the
+  cookie is re-read and the request retried once if the credentials rotated
+  (node restart). A 403 is not retried.
+- `pivx-rpc`: `AuthError` (HTTP 401/403) as a distinct, matchable error.
+
+### Changed
+
+- `pivx-rpc`: `ShieldWatcher` balance-change detection compares integer
+  satoshis (round-then-sum), so floating-point note amounts cannot fire a
+  spurious balance event.
+
 ## [0.2.0] - 2026-07-02
 
 ### Added

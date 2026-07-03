@@ -54,6 +54,18 @@ Credentials come from `rpcuser`/`rpcpassword` in pivx.conf. The client
 speaks HTTP Basic auth. There is no TLS: run the node on localhost or
 tunnel the connection; do not expose the RPC port.
 
+Or read credentials from the node's `.cookie` file instead of hardcoding
+them (Node-only; the file is read via a dynamic `node:fs` import):
+
+```js
+const client = await PivxClient.fromCookie('/home/pivx/.pivx/.cookie');
+```
+
+pivxd rewrites the cookie on every restart. On an HTTP 401 the client
+re-reads the file and retries the request once if the credentials changed,
+so a node restart doesn't require reconstructing the client. A 403 (an
+IP/ACL denial a cookie can't fix) is not retried and throws `AuthError`.
+
 ### Calling the node
 
 Typed methods cover the blockchain, wallet, shield, masternode, staking,
@@ -76,7 +88,10 @@ const tips = await client.call('getchaintips');
 
 Node errors throw `RpcError` with the node's own `code` and message.
 Transport failures (refused connection, timeout) throw plain errors, so
-retry logic can tell them apart:
+retry logic can tell them apart. An HTTP 401/403 that survives the cookie
+refresh throws `AuthError` (with the `status`), a distinct type from a
+rejected RPC — match it to surface a credentials problem rather than
+retrying:
 
 ```js
 try {
@@ -219,6 +234,26 @@ try {
 
 Do not run two `sync` calls on one wallet concurrently, and do not build a
 transaction while a sync is in flight. One wallet, one writer.
+
+A long first sync can be cancelled with an `AbortSignal`. Both
+`PivxWallet.sync` and `TransparentWallet.sync` take one in their options and
+check it at each batch boundary; aborting throws `signal.reason` (an
+`AbortError` by default) with state left consistent — only fully applied,
+root-verified batches are kept — and releases the busy guard, so a later
+`sync` resumes where this one stopped:
+
+```js
+const ac = new AbortController();
+const timer = setTimeout(() => ac.abort(), 30_000);   // give up after 30s
+try {
+  await wallet.sync(client, { signal: ac.signal });
+} catch (e) {
+  if (e?.name !== 'AbortError') throw e;
+  // partial progress is persisted; call sync again later to continue
+} finally {
+  clearTimeout(timer);
+}
+```
 
 ### Detecting deposits
 

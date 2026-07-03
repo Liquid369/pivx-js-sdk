@@ -260,6 +260,27 @@ export class PivxWallet {
     return this.nullifierMap.get(nullifier);
   }
 
+  /**
+   * Remove every nullifier-map entry that is no longer referenced by a
+   * currently tracked unspent note or by a pending spend, and return the
+   * number removed. Explicit and opt-in: the map is what powers
+   * {@link getNoteFromNullifier}, so callers using nullifier → note
+   * attribution should call this only after reconciling the spends they
+   * care about. Deterministic; the save/load format is unchanged.
+   */
+  pruneNullifiers(): number {
+    const live = new Set(this.notes.map((n) => n.nullifier));
+    for (const nulls of this.pendingSpends.values()) for (const n of nulls) live.add(n);
+    let removed = 0;
+    for (const nullifier of this.nullifierMap.keys()) {
+      if (!live.has(nullifier)) {
+        this.nullifierMap.delete(nullifier);
+        removed++;
+      }
+    }
+    return removed;
+  }
+
   // ── Scanning ──────────────────────────────────────────────────────────────
 
   /**
@@ -365,6 +386,11 @@ export class PivxWallet {
     if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
     this.busy = true;
     try {
+      const throwIfAborted = () => {
+        if (opts.signal?.aborted) {
+          throw opts.signal.reason ?? new DOMException('sync aborted', 'AbortError');
+        }
+      };
       // NaN/0/fractional → sane integer; 0 would loop forever.
       const batchSize = Math.max(1, Math.floor(opts.batchSize ?? 100) || 1);
       // getblock verbosity 2 is heavy. A default node has 4 RPC threads and a
@@ -389,11 +415,13 @@ export class PivxWallet {
         return block;
       };
       while (this.lastProcessedBlock < tip) {
+        throwIfAborted(); // batch boundary: nothing applied yet, state consistent
         const from = this.lastProcessedBlock + 1;
         const to = Math.min(from + batchSize - 1, tip);
         const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
         const blocks: Awaited<ReturnType<typeof fetchBlock>>[] = [];
         for (let i = 0; i < heights.length; i += concurrency) {
+          throwIfAborted(); // chunk boundary: before issuing the next RPCs
           blocks.push(...(await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock))));
         }
 

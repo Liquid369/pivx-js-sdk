@@ -99,6 +99,40 @@ test('pendingTransactions exposes in-flight spends for reconciliation', async ()
   assert.deepEqual(w.pendingTransactions(), { 'tx-abc': [nullifier] });
 });
 
+test('pruneNullifiers removes only settled spent entries; live attribution intact', async () => {
+  const w = await newWallet();
+  // The same output scanned at two positions yields two notes with distinct
+  // (position-dependent) nullifiers — two map entries.
+  w.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);
+  w.handleBlocks([{ height: BIRTH + 2, txs: [{ hex: TX_HEX, txid: 'fixture2' }] }]);
+  const [spentNote, liveNote] = w.getNotes();
+  assert.equal(w.getNotes().length, 2);
+  assert.notEqual(spentNote.nullifier, liveNote.nullifier);
+
+  // Everything still referenced by an unspent note: nothing to prune.
+  assert.equal(w.pruneNullifiers(), 0);
+
+  // Spend the first note and settle it (broadcast accepted → finalize).
+  w['pendingSpends'].set('tx-spend', [spentNote.nullifier]);
+  w.finalizeTransaction('tx-spend');
+
+  // An in-flight (unsettled) spend whose note is no longer tracked must
+  // survive pruning: pendingSpends still references it.
+  const inflight = 'ab'.repeat(32);
+  w['nullifierMap'].set(inflight, { recipient: 'pending', value: 1 });
+  w['pendingSpends'].set('tx-inflight', [inflight]);
+
+  assert.equal(w.pruneNullifiers(), 1, 'only the settled spend is pruned');
+  assert.equal(w.getNoteFromNullifier(spentNote.nullifier), undefined);
+  assert.equal(w.getNoteFromNullifier(inflight)?.recipient, 'pending');
+  const live = w.getNoteFromNullifier(liveNote.nullifier);
+  assert.equal(live?.recipient, SHIELD_ADDRESS);
+  assert.equal(live?.value, 1_000_000_000);
+  assert.equal(w.getBalance(), 1_000_000_000);
+  // Prune is idempotent/deterministic.
+  assert.equal(w.pruneNullifiers(), 0);
+});
+
 test('reloadFromCheckpoint resets scan state', async () => {
   const w = await newWallet();
   w.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);

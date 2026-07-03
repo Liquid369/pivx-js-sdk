@@ -128,6 +128,26 @@ test('sync with batchSize 0 terminates (clamped to 1)', async () => {
   assert.equal(w.lastScannedBlock(), 3);
 });
 
+test('sync abort: throws signal.reason at the batch boundary, keeps scanned blocks, releases busy', async () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(17), 'mainnet', 0, 5);
+  const client = {
+    getBlockCount: async () => 4,
+    getBlockHash: async (h) => `hash:${h}`,
+    getBlock: async (hash) => stubBlock(Number(hash.split(':')[1])),
+  };
+  const ac = new AbortController();
+  const reason = new Error('operator stop');
+  await assert.rejects(
+    w.sync(client, { batchSize: 2, signal: ac.signal, onProgress: () => ac.abort(reason) }),
+    (err) => err === reason, // custom abort reason propagates as-is
+  );
+  assert.equal(w.lastScannedBlock(), 2); // only the fully scanned first batch
+
+  // Busy guard released: a follow-up sync resumes from block 3 and completes.
+  await w.sync(client);
+  assert.equal(w.lastScannedBlock(), 4);
+});
+
 test('recognizes, tracks, and spends 26-byte exchange (EXM) outputs', () => {
   const seed = new Uint8Array(32).fill(11);
   const w = TransparentWallet.create(seed, 'mainnet', 0, 5);

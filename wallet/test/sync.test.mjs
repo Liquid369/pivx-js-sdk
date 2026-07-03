@@ -63,6 +63,37 @@ test('sync pulls blocks from RPC, finds the note, and verifies the sapling root'
   }
 });
 
+test('sync abort: throws at the batch boundary, keeps applied batches, releases busy', async () => {
+  const goodRoot = await expectedRootAfterFixture();
+  const wallet = await PivxWallet.create({ spendingKey: EXTSK, network: 'testnet', birthHeight: BIRTH });
+  wallet['lastProcessedBlock'] = BIRTH;
+  wallet['startValidated'] = true; // synthetic stub chain: skip node checkpoint validation
+  // Plain object stub: two blocks past BIRTH; the empty second block leaves the root unchanged.
+  const client = {
+    getBlockCount: async () => BIRTH + 2,
+    getBlockHash: async (h) => `hash${h}`,
+    getBlock: async (hash) => ({
+      height: Number(hash.slice(4)),
+      finalsaplingroot: goodRoot,
+      tx: Number(hash.slice(4)) === BIRTH + 1 ? [{ hex: TX_HEX, txid: 'fixture' }] : [],
+    }),
+  };
+
+  const ac = new AbortController();
+  await assert.rejects(
+    wallet.sync(client, { batchSize: 1, signal: ac.signal, onProgress: () => ac.abort() }),
+    (err) => err.name === 'AbortError',
+  );
+  // Only the fully applied first batch is kept.
+  assert.equal(wallet.getLastSyncedBlock(), BIRTH + 1);
+  assert.equal(wallet.getBalance(), 1_000_000_000);
+
+  // Busy guard released: a follow-up sync resumes and completes.
+  await wallet.sync(client, { batchSize: 1 });
+  assert.equal(wallet.getLastSyncedBlock(), BIRTH + 2);
+  assert.equal(wallet.getBalance(), 1_000_000_000);
+});
+
 test('sync fails loudly when the node sapling root diverges', async () => {
   const node = await stubNode(makeHandlers('00'.repeat(32)));
   try {

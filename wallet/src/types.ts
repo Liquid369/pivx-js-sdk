@@ -90,6 +90,14 @@ export interface SyncOptions {
    */
   rpcConcurrency?: number;
   onProgress?: (height: number, tip: number) => void;
+  /**
+   * Abort the sync. Checked at every batch and concurrency-chunk boundary,
+   * before the next round of RPCs is issued; when set, sync throws
+   * `signal.reason` (an `AbortError` DOMException by default). State stays
+   * consistent: only fully applied, root-verified batches are kept, and the
+   * busy guard is released so a follow-up sync can resume where it stopped.
+   */
+  signal?: AbortSignal;
 }
 
 /** Serialized wallet state (spending key deliberately excluded). */

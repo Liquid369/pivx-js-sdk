@@ -260,15 +260,26 @@ export class TransparentWallet {
    */
   async sync(
     client: PivxClient,
-    { fromHeight = 0, batchSize = 100, onProgress }: {
+    { fromHeight = 0, batchSize = 100, onProgress, signal }: {
       fromHeight?: number;
       batchSize?: number;
       onProgress?: (height: number, tip: number) => void;
+      /**
+       * Abort the sync. Checked at every batch and concurrency-chunk
+       * boundary, before the next round of RPCs is issued; when set, sync
+       * throws `signal.reason` (an `AbortError` DOMException by default).
+       * Fully scanned blocks are kept and the busy guard is released, so a
+       * follow-up sync resumes where this one stopped.
+       */
+      signal?: AbortSignal;
     } = {},
   ): Promise<void> {
     if (this.busy) throw new Error('wallet is busy: another sync is in progress');
     this.busy = true;
     try {
+      const throwIfAborted = () => {
+        if (signal?.aborted) throw signal.reason ?? new DOMException('sync aborted', 'AbortError');
+      };
       const concurrency = 8;
       const tip = await client.getBlockCount();
       const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
@@ -277,9 +288,11 @@ export class TransparentWallet {
       const batch = Math.max(1, Math.floor(batchSize) || 1);
       let from = Math.max(fromHeight, this.lastScanned + 1);
       while (from <= tip) {
+        throwIfAborted(); // batch boundary: before issuing the next round of RPCs
         const to = Math.min(from + batch - 1, tip);
         const heights = Array.from({ length: to - from + 1 }, (_, i) => from + i);
         for (let i = 0; i < heights.length; i += concurrency) {
+          throwIfAborted(); // chunk boundary: previous chunk fully scanned
           const blocks = await Promise.all(heights.slice(i, i + concurrency).map(fetchBlock));
           for (const b of blocks) {
             // getblock verbosity 2 always carries these; a block without them
