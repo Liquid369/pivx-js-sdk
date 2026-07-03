@@ -1,12 +1,23 @@
 import type {
   BlockchainInfo,
+  BlockHeader,
+  ChainTip,
+  DecodedTransaction,
+  ListSinceBlock,
+  PrevTx,
   ReceivedShieldNote,
   ShieldNote,
   ShieldRecipient,
   ShieldSendSource,
   ShieldTxView,
+  SignRawTransactionResult,
+  TransactionInfo,
+  TxInput,
+  TxOut,
   Unspent,
+  ValidateAddress,
   WalletInfo,
+  WalletTransaction,
 } from './types.js';
 
 export interface PivxClientOptions {
@@ -125,15 +136,18 @@ export class PivxClient {
     });
   }
 
-  /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
-  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
-    while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
-    const payload = JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params });
+  /**
+   * POST a JSON-RPC payload and return the auth-checked {@link Response}.
+   * `label` names the call in error messages. Shared by {@link call} and
+   * {@link batch} so both get the same cookie-refresh and auth handling.
+   *
+   * pivxd rewrites .cookie on restart: on 401, re-read it and retry once when
+   * the credentials actually changed (same contract as the Rust SDK). A 403
+   * is an IP/ACL denial a cookie can't fix, so it is not retried. An
+   * unreadable cookie counts as unchanged and falls through to AuthError.
+   */
+  private async send(payload: string, label: string): Promise<Response> {
     let res = await this.post(payload);
-    // pivxd rewrites .cookie on restart: on 401, re-read it and retry once when
-    // the credentials actually changed (same contract as the Rust SDK). A 403
-    // is an IP/ACL denial a cookie can't fix, so it is not retried. An
-    // unreadable cookie counts as unchanged and falls through to AuthError.
     if (res.status === 401 && this.cookiePath) {
       const fresh = await PivxClient.readCookie(this.cookiePath).catch(() => undefined);
       if (fresh !== undefined && fresh !== this.authHeader) {
@@ -142,7 +156,15 @@ export class PivxClient {
         res = await this.post(payload);
       }
     }
-    if (res.status === 401 || res.status === 403) throw new AuthError(method, res.status);
+    if (res.status === 401 || res.status === 403) throw new AuthError(label, res.status);
+    return res;
+  }
+
+  /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
+  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
+    while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
+    const payload = JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params });
+    const res = await this.send(payload, method);
     // Read the body with a hard byte cap so a hostile node can't exhaust
     // memory. Streaming means the cap holds even without a Content-Length.
     const raw = await this.readCapped(res, method);
@@ -155,6 +177,39 @@ export class PivxClient {
     if (body.error) throw new RpcError(body.error.code, body.error.message, method);
     if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
     return body.result as T;
+  }
+
+  /**
+   * Execute several calls in a single JSON-RPC batch (one HTTP round-trip).
+   * Returns one element per call, in request order: `{ result }` when the
+   * node reported no error for that call, otherwise `{ error: { code,
+   * message } }`. A per-call error does not fail the batch; a transport/auth
+   * failure rejects the whole promise. Rejects an empty `calls` array.
+   */
+  async batch(
+    calls: { method: string; params?: unknown[] }[],
+  ): Promise<Array<{ result: unknown } | { error: { code: number; message: string } }>> {
+    if (calls.length === 0) throw new Error('batch: no calls provided');
+    const payload = JSON.stringify(
+      calls.map((c) => ({ jsonrpc: '1.0', id: ++nextId, method: c.method, params: c.params ?? [] })),
+    );
+    const res = await this.send(payload, 'batch');
+    const raw = await this.readCapped(res, 'batch');
+    let arr: { result?: unknown; error?: { code: number; message: string } | null }[];
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      throw new Error(`batch: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
+    }
+    if (!Array.isArray(arr)) throw new Error(`batch: expected a JSON array response`);
+    if (arr.length !== calls.length) {
+      throw new Error(`batch: node returned ${arr.length} results for ${calls.length} calls`);
+    }
+    return arr.map((el) =>
+      el.error == null
+        ? { result: el.result }
+        : { error: { code: el.error.code, message: el.error.message } },
+    );
   }
 
   /** Read a response body as text, aborting once it exceeds maxResponseBytes. */
@@ -208,8 +263,57 @@ export class PivxClient {
     return this.call<BlockchainInfo>('getblockchaininfo');
   }
 
-  getRawTransaction(txid: string, verbose = false) {
-    return this.call<string | Record<string, unknown>>('getrawtransaction', txid, verbose ? 1 : 0);
+  /** Block header. verbose=true (default) → typed object; false → raw hex. */
+  getBlockHeader(blockhash: string, verbose?: true): Promise<BlockHeader>;
+  getBlockHeader(blockhash: string, verbose: false): Promise<string>;
+  getBlockHeader(blockhash: string, verbose = true): Promise<BlockHeader | string> {
+    return this.call<BlockHeader | string>('getblockheader', blockhash, verbose);
+  }
+
+  /** All known chain tips (active tip plus any side branches). */
+  getChainTips() {
+    return this.call<ChainTip[]>('getchaintips');
+  }
+
+  /** Unspent output at (txid, n), or null when spent / not found. */
+  getTxOut(txid: string, n: number, includeMempool = true) {
+    return this.call<TxOut | null>('gettxout', txid, n, includeMempool);
+  }
+
+  /** Raw tx. verbose=false (default) → hex; true → decoded object. */
+  getRawTransaction(txid: string, verbose?: false, blockhash?: string): Promise<string>;
+  getRawTransaction(txid: string, verbose: true, blockhash?: string): Promise<DecodedTransaction>;
+  getRawTransaction(
+    txid: string,
+    verbose = false,
+    blockhash?: string,
+  ): Promise<string | DecodedTransaction> {
+    return this.call<string | DecodedTransaction>(
+      'getrawtransaction',
+      txid,
+      verbose ? 1 : 0,
+      blockhash,
+    );
+  }
+
+  /** Build an unsigned raw tx from inputs and address→amount outputs. */
+  createRawTransaction(inputs: TxInput[], outputs: Record<string, number>, locktime = 0) {
+    return this.call<string>('createrawtransaction', inputs, outputs, locktime);
+  }
+
+  decodeRawTransaction(hex: string) {
+    return this.call<DecodedTransaction>('decoderawtransaction', hex);
+  }
+
+  /** Sign a raw tx (PIVX RPC is `signrawtransaction`, not `...withkey`). */
+  signRawTransaction(hex: string, prevTxs?: PrevTx[], privKeys?: string[], sigHashType = 'ALL') {
+    return this.call<SignRawTransactionResult>(
+      'signrawtransaction',
+      hex,
+      prevTxs,
+      privKeys,
+      sigHashType,
+    );
   }
 
   sendRawTransaction(hex: string) {
@@ -234,8 +338,67 @@ export class PivxClient {
     return this.call<string>('sendtoaddress', address, amount, comment);
   }
 
-  getTransaction(txid: string) {
-    return this.call<Record<string, unknown>>('gettransaction', txid);
+  getTransaction(txid: string, includeWatchOnly = false) {
+    return this.call<TransactionInfo>('gettransaction', txid, includeWatchOnly);
+  }
+
+  /** Wallet transactions since `blockhash` (or from genesis when omitted).
+   * The node rejects a null `blockhash`, so when it is omitted no params are
+   * sent — `targetConfirmations`/`includeWatchOnly` apply only with a hash. */
+  listSinceBlock(blockhash?: string, targetConfirmations = 1, includeWatchOnly = false) {
+    return blockhash === undefined
+      ? this.call<ListSinceBlock>('listsinceblock')
+      : this.call<ListSinceBlock>('listsinceblock', blockhash, targetConfirmations, includeWatchOnly);
+  }
+
+  /** Recent wallet transactions. The legacy `dummy="*"` account arg is passed
+   * internally and not exposed. */
+  listTransactions(
+    count = 10,
+    from = 0,
+    includeWatchOnly = false,
+    includeDelegated = true,
+    includeCold = true,
+  ) {
+    return this.call<WalletTransaction[]>(
+      'listtransactions',
+      '*',
+      count,
+      from,
+      includeWatchOnly,
+      includeDelegated,
+      includeCold,
+    );
+  }
+
+  /** Send to many address→amount recipients (transparent or shield); returns
+   * the txid. The legacy `dummy=""` account arg is passed internally. */
+  sendMany(
+    amounts: Record<string, number>,
+    minConf = 1,
+    comment?: string,
+    includeDelegated = false,
+    subtractFeeFrom?: string[],
+  ) {
+    return this.call<string>(
+      'sendmany',
+      '',
+      amounts,
+      minConf,
+      comment,
+      includeDelegated,
+      subtractFeeFrom,
+    );
+  }
+
+  /** New transparent exchange (EXM/EXT) address. */
+  getNewExchangeAddress(label = '') {
+    return this.call<string>('getnewexchangeaddress', label);
+  }
+
+  /** Mark an in-wallet transaction abandoned (node returns null on success). */
+  async abandonTransaction(txid: string): Promise<void> {
+    await this.call<null>('abandontransaction', txid);
   }
 
   getWalletInfo() {
@@ -243,7 +406,7 @@ export class PivxClient {
   }
 
   validateAddress(address: string) {
-    return this.call<Record<string, unknown>>('validateaddress', address);
+    return this.call<ValidateAddress>('validateaddress', address);
   }
 
   // ── Shield (SHIELD/Sapling) ───────────────────────────────────────────────

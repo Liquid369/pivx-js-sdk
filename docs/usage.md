@@ -79,11 +79,42 @@ const fee = await client.estimateSmartFee(6);              // smart fee estimate
 const addr = await client.getNewShieldAddress();
 ```
 
+v0.4 widened the typed surface across blockchain introspection, raw
+transactions, and exchange-grade wallet calls:
+
+```js
+const header = await client.getBlockHeader(await client.getBestBlockHash());
+const utxo = await client.getTxOut(txid, 0);       // null once the output is spent
+
+// Verbose getRawTransaction decodes ANY txid — not just wallet ones — and
+// carries confirmations. Needs -txindex, or pass a blockhash to look in one block:
+//   getRawTransaction(txid, true, blockhash)
+const tx = await client.getRawTransaction(txid, true);
+console.log(tx.confirmations);
+
+// Reorg-safe deposit cursor for exchanges: page new wallet txs from the last
+// block you processed; the returned lastblock is your next cursor.
+const { transactions, lastblock } = await client.listSinceBlock(lastProcessed);
+
+// Batch payout to many recipients in one transaction.
+const payoutTxid = await client.sendMany({ 'D1...': 1.5, 'D2...': 2.0 });
+
+// Build → sign → broadcast a raw transaction (the node's RPC is
+// signrawtransaction, 4 params).
+const rawHex = await client.createRawTransaction([{ txid, vout: 0 }], { 'D...': 1.0 });
+const signed = await client.signRawTransaction(rawHex);
+if (signed.complete) await client.sendRawTransaction(signed.hex);
+```
+
+`gettransaction` and `validateaddress` are typed too, now returning
+structured results (`TransactionInfo`, `ValidateAddress`) rather than opaque
+objects.
+
 Anything still not wrapped goes through `call`, which takes the method name
 and positional params exactly as `pivx-cli` would:
 
 ```js
-const tips = await client.call('getchaintips');
+const decoded = await client.call('decodescript', scriptHex);
 ```
 
 Node errors throw `RpcError` with the node's own `code` and message.
@@ -100,6 +131,26 @@ try {
   if (e instanceof RpcError && e.code === -13) {
     // wallet locked: walletpassphrase first
   }
+}
+```
+
+### Batch calls
+
+`batch` sends several calls in one HTTP round-trip. Results come back in
+request order; a per-call error is reported in place (as `{ error }`) and
+does not fail the others — only a transport/auth failure rejects the whole
+promise. Handy for fanning out a set of lookups, e.g. several block hashes or
+txids at once:
+
+```js
+const results = await client.batch([
+  { method: 'getblockhash', params: [100] },
+  { method: 'getblockhash', params: [200] },
+  { method: 'gettxout', params: [txid, 0] },
+]);
+for (const r of results) {
+  if ('error' in r) console.error(r.error.code, r.error.message);
+  else console.log(r.result);
 }
 ```
 

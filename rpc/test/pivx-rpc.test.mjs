@@ -262,3 +262,195 @@ test('balance change detection is integer-sat: FP noise fires no spurious event'
     node.close();
   }
 });
+
+test('getBlockHeader verbose returns typed header; default verbose=true; absent optional is undefined', async () => {
+  const node = await stubNode({
+    getblockheader: () => ({
+      result: {
+        hash: 'h', confirmations: 5, height: 100, version: 1, merkleroot: 'm',
+        time: 1, mediantime: 1, nonce: 0, bits: '1d00ffff', difficulty: 1,
+        chainwork: '00', acc_checkpoint: '0',
+        shield_pool_value: { chainValue: 1.5, valueDelta: 0.5 },
+        previousblockhash: 'prev', chainlock: true, // nextblockhash absent (tip)
+      },
+    }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const h = await client.getBlockHeader('h');
+    assert.equal(h.height, 100);
+    assert.equal(h.shield_pool_value.chainValue, 1.5);
+    assert.equal(h.previousblockhash, 'prev');   // present optional
+    assert.equal(h.nextblockhash, undefined);    // absent optional
+    assert.deepEqual(node.requests[0].body.params, ['h', true]); // default verbose=true
+  } finally {
+    node.close();
+  }
+});
+
+test('getTxOut returns the typed object, or null when spent/not-found', async () => {
+  const node = await stubNode({
+    gettxout: (p) => (p[1] === 0
+      ? ({ result: {
+          bestblock: 'b', confirmations: 3, value: 1.5, coinbase: false,
+          scriptPubKey: { asm: 'a', hex: 'aa', type: 'pubkeyhash', addresses: ['DAddr'] },
+        } })
+      : ({ result: null })),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const out = await client.getTxOut('t', 0);
+    assert.ok(out);
+    assert.equal(out.value, 1.5);
+    assert.equal(out.scriptPubKey.type, 'pubkeyhash');
+    assert.deepEqual(node.requests[0].body.params, ['t', 0, true]); // include_mempool default true
+    assert.equal(await client.getTxOut('t', 9), null);
+  } finally {
+    node.close();
+  }
+});
+
+test('getRawTransaction: hex when non-verbose, decoded object when verbose (absent optional undefined)', async () => {
+  const node = await stubNode({
+    getrawtransaction: (p) => (p[1] === 1
+      ? ({ result: {
+          txid: 't', version: 1, type: 0, size: 100, locktime: 0,
+          vin: [], vout: [], hex: 'deadbeef', chainlock: false, // mempool tx: no confirmations/blockhash
+        } })
+      : ({ result: 'deadbeef' })),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    assert.equal(await client.getRawTransaction('t'), 'deadbeef');
+    assert.deepEqual(node.requests[0].body.params, ['t', 0]);
+    const d = await client.getRawTransaction('t', true);
+    assert.equal(d.txid, 't');
+    assert.equal(d.chainlock, false);
+    assert.equal(d.confirmations, undefined); // absent optional (mempool)
+    assert.deepEqual(node.requests[1].body.params, ['t', 1]);
+  } finally {
+    node.close();
+  }
+});
+
+test('validateAddress typed: invalid → only isvalid; valid → address/ismine present', async () => {
+  const node = await stubNode({
+    validateaddress: (p) => (p[0] === 'bad'
+      ? ({ result: { isvalid: false } })
+      : ({ result: { isvalid: true, address: p[0], ismine: true, isstaking: false } })),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const bad = await client.validateAddress('bad');
+    assert.equal(bad.isvalid, false);
+    assert.equal(bad.address, undefined); // absent optional
+    const good = await client.validateAddress('DGoodAddr');
+    assert.equal(good.isvalid, true);
+    assert.equal(good.address, 'DGoodAddr'); // present optional
+    assert.equal(good.ismine, true);
+  } finally {
+    node.close();
+  }
+});
+
+test('listTransactions injects dummy "*", sendMany injects dummy "", abandonTransaction resolves void', async () => {
+  const node = await stubNode({
+    listtransactions: () => ({ result: [] }),
+    sendmany: () => ({ result: 'txidABC' }),
+    abandontransaction: () => ({ result: null }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    await client.listTransactions();
+    assert.deepEqual(node.requests[0].body.params, ['*', 10, 0, false, true, true]);
+
+    assert.equal(await client.sendMany({ D1: 1.5 }, 2), 'txidABC');
+    // comment undefined (not trailing) serializes to null; trailing subtractFeeFrom trimmed.
+    assert.deepEqual(node.requests[1].body.params, ['', { D1: 1.5 }, 2, null, false]);
+
+    assert.equal(await client.abandonTransaction('t'), undefined);
+  } finally {
+    node.close();
+  }
+});
+
+/** Batch stub: echoes the request array, replies with a JSON array of results. */
+async function batchNode(reply) {
+  let received;
+  const server = createServer(async (req, res) => {
+    received = JSON.parse(await new Promise((r) => {
+      let d = '';
+      req.on('data', (c) => (d += c));
+      req.on('end', () => r(d));
+    }));
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(reply(received)));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return { port: server.address().port, received: () => received, close: () => server.close() };
+}
+
+test('batch posts a JSON array and returns {result}/{error} in request order', async () => {
+  const node = await batchNode((reqs) => [
+    { id: reqs[0].id, result: 100, error: null },
+    { id: reqs[1].id, result: null, error: { code: -5, message: 'nope' } },
+  ]);
+  try {
+    const client = new PivxClient({ port: node.port });
+    const out = await client.batch([
+      { method: 'getblockcount' },
+      { method: 'getblockhash', params: [999999999] },
+    ]);
+    const sent = node.received();
+    assert.ok(Array.isArray(sent), 'server received a JSON array');
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0].method, 'getblockcount');
+    assert.deepEqual(sent[0].params, []);           // missing params default to []
+    assert.deepEqual(sent[1].params, [999999999]);
+    assert.deepEqual(out, [
+      { result: 100 },
+      { error: { code: -5, message: 'nope' } },
+    ]);
+  } finally {
+    node.close();
+  }
+});
+
+test('batch rejects an empty array', async () => {
+  const client = new PivxClient({ port: 1 });
+  await assert.rejects(client.batch([]), /no calls/);
+});
+
+test('batch rejects a node result-count mismatch', async () => {
+  const node = await batchNode(() => [{ result: 1, error: null }]); // 1 result for 2 calls
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(
+      client.batch([{ method: 'getblockcount' }, { method: 'getbestblockhash' }]),
+      /1 results for 2 calls/,
+    );
+  } finally {
+    node.close();
+  }
+});
+
+test('listSinceBlock() omitted sends no params; with a hash sends all three', async () => {
+  // The node rejects a null blockhash, so an omitted hash must send empty params.
+  const node = createServer(async (req, res) => {
+    node.body = JSON.parse(await new Promise((r) => { let d = ''; req.on('data', (c) => (d += c)); req.on('end', () => r(d)); }));
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ id: node.body.id, result: { transactions: [], lastblock: 'lb' }, error: null }));
+  });
+  node.listen(0, '127.0.0.1');
+  await once(node, 'listening');
+  try {
+    const client = new PivxClient({ port: node.address().port });
+    await client.listSinceBlock();
+    assert.deepEqual(node.body.params, [], 'no blockhash → empty params');
+    await client.listSinceBlock('abcd', 6, true);
+    assert.deepEqual(node.body.params, ['abcd', 6, true], 'blockhash → all three params');
+  } finally {
+    node.close();
+  }
+});

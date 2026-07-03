@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-03
+
+### Added
+
+- `pivx-rpc`: batch JSON-RPC — `client.batch([{ method, params }, ...])` runs
+  several calls in one HTTP round-trip, returning `{ result }` | `{ error }`
+  per call in request order; a per-call error does not fail the batch.
+- `pivx-rpc`: typed methods for the exchange deposit/withdrawal workflow —
+  `listSinceBlock` (reorg-safe deposit cursor), `listTransactions`, `sendMany`,
+  `getNewExchangeAddress`, `abandonTransaction`, `getTxOut`, `getBlockHeader`,
+  `getChainTips`, `createRawTransaction`, `decodeRawTransaction`,
+  `signRawTransaction`, and a verbose `getRawTransaction` (typed decoded object
+  with confirmations — works for a non-wallet txid with `-txindex`).
+
+### Changed
+
+- `pivx-rpc`: `getTransaction` and `validateAddress` now return typed objects
+  instead of `Record<string, unknown>` (breaking, hence `pivx-rpc` 0.3.0).
+
 ## [0.3.0] - 2026-07-03
 
 ### Added
