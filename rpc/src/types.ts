@@ -319,3 +319,213 @@ export interface ValidateAddress {
   diversifiedtransmissionkey?: string;
   [key: string]: unknown;
 }
+
+/** One network's reachability, from `getnetworkinfo.networks`. */
+export interface NetworkEntry {
+  name: string;
+  limited: boolean;
+  reachable: boolean;
+  proxy: string;
+  proxy_randomize_credentials: boolean;
+  [key: string]: unknown;
+}
+
+/** A discovered local address, from `getnetworkinfo.localaddresses`. */
+export interface LocalAddress {
+  address: string;
+  port: number;
+  score: number;
+  [key: string]: unknown;
+}
+
+/** `getnetworkinfo` result. `localservices`/`networkactive`/`connections` are
+ * absent on some builds; the shape is volatile so unknown fields pass through. */
+export interface NetworkInfo {
+  version: number;
+  subversion: string;
+  protocolversion: number;
+  localservices?: string;
+  timeoffset: number;
+  networkactive?: boolean;
+  connections?: number;
+  networks: NetworkEntry[];
+  relayfee: number;
+  localaddresses: LocalAddress[];
+  warnings: string;
+  [key: string]: unknown;
+}
+
+/** One peer entry from `getpeerinfo`. Many fields appear only in some
+ * connection states (`addrlocal`, `synced_*`, `inflight`, the `verif_mn_*`
+ * masternode-verification fields, …), so they are all optional. */
+export interface PeerInfo {
+  id: number;
+  addr: string;
+  addrlocal?: string;
+  mapped_as?: number;
+  services: string;
+  lastsend: number;
+  lastrecv: number;
+  bytessent: number;
+  bytesrecv: number;
+  conntime: number;
+  timeoffset: number;
+  pingtime: number;
+  pingwait?: number;
+  version: number;
+  subver: string;
+  inbound: boolean;
+  addnode: boolean;
+  masternode: boolean;
+  startingheight: number;
+  banscore?: number;
+  synced_headers?: number;
+  synced_blocks?: number;
+  inflight?: number[];
+  addr_processed?: number;
+  addr_rate_limited?: number;
+  whitelisted: boolean;
+  bytessent_per_msg: Record<string, number>;
+  bytesrecv_per_msg: Record<string, number>;
+  masternode_iqr_conn?: boolean;
+  verif_mn_proreg_tx_hash?: string;
+  verif_mn_operator_pubkey_hash?: string;
+  [key: string]: unknown;
+}
+
+/** `getmempoolinfo` result. */
+export interface MempoolInfo {
+  loaded: boolean;
+  size: number;
+  bytes: number;
+  usage: number;
+  mempoolminfee: number;
+  minrelaytxfee: number;
+  [key: string]: unknown;
+}
+
+/** One entry from verbose `getrawmempool`. Amounts (`fee`/`modifiedfee`) are
+ * PIV numbers, but `descendantfees` is RAW satoshis (an integer), not PIV. */
+export interface MempoolEntry {
+  size: number;
+  fee: number;
+  modifiedfee: number;
+  time: number;
+  height: number;
+  descendantcount: number;
+  descendantsize: number;
+  /** Raw satoshis, not PIV. As with any JS JSON number, values above
+   * 2^53 lose precision here; realistic mempool fees stay well below that. */
+  descendantfees: number;
+  depends: string[];
+  [key: string]: unknown;
+}
+
+/** `getsupplyinfo` result (PIVX-specific coin-supply totals). */
+export interface SupplyInfo {
+  updateheight: number;
+  transparentsupply: number;
+  shieldsupply: number;
+  totalsupply: number;
+  [key: string]: unknown;
+}
+
+/** `getblockindexstats` result. Note the space-separated keys, and that
+ * `ttlfee`/`feeperkb` are money STRINGS (FormatMoney), not numbers. */
+export interface BlockIndexStats {
+  'Starting block': number;
+  'Ending block': number;
+  txcount: number;
+  txcount_all: number;
+  txbytes: number;
+  /** Money string (FormatMoney), not a number. */
+  ttlfee: string;
+  /** Money string (FormatMoney), not a number. */
+  feeperkb: string;
+  [key: string]: unknown;
+}
+
+/** `getmininginfo` result. Normal mode emits BOTH `errors` and `warnings`;
+ * `generate`/`hashespersec` appear only while the node is generating. */
+export interface MiningInfo {
+  blocks: number;
+  currentblocksize: number;
+  currentblocktx: number;
+  difficulty: number;
+  genproclimit: number;
+  networkhashps: number;
+  pooledtx: number;
+  testnet: boolean;
+  chain: string;
+  errors: string;
+  warnings?: string;
+  generate?: boolean;
+  hashespersec?: number;
+  [key: string]: unknown;
+}
+
+/** `estimatesmartfee` result. `feerate` is -1 when there is not enough data
+ * to make an estimate. (No `errors` array, unlike Bitcoin Core.) */
+export interface EstimateSmartFee {
+  feerate: number;
+  blocks: number;
+  [key: string]: unknown;
+}
+
+/** One budget proposal from `getbudgetinfo`. Keys are PascalCase, exactly as
+ * the node emits them. `IsInvalidReason` is present only when invalid. */
+export interface BudgetProposal {
+  Name: string;
+  URL: string;
+  Hash: string;
+  FeeHash: string;
+  BlockStart: number;
+  BlockEnd: number;
+  TotalPaymentCount: number;
+  RemainingPaymentCount: number;
+  PaymentAddress: string;
+  Ratio: number;
+  Yeas: number;
+  Nays: number;
+  Abstains: number;
+  TotalPayment: number;
+  MonthlyPayment: number;
+  IsEstablished: boolean;
+  IsValid: boolean;
+  IsInvalidReason?: string;
+  Allotted: number;
+  [key: string]: unknown;
+}
+
+/** One entry from `getbudgetprojection`: a proposal plus the running total of
+ * budget allotted through it. */
+export interface BudgetProjection extends BudgetProposal {
+  TotalBudgetAllotted: number;
+}
+
+/** `getstakingstatus` result. The `lastattempt_*` fields appear only once the
+ * node has attempted to stake. */
+export interface StakingStatus {
+  staking_status: boolean;
+  staking_enabled: boolean;
+  coldstaking_enabled: boolean;
+  haveconnections: boolean;
+  mnsync: boolean;
+  walletunlocked: boolean;
+  stakeablecoins: number;
+  stakingbalance: number;
+  stakesplitthreshold: number;
+  lastattempt_age?: number;
+  lastattempt_depth?: number;
+  lastattempt_hash?: string;
+  lastattempt_coins?: number;
+  lastattempt_tries?: number;
+  [key: string]: unknown;
+}
+
+/** One entry from `liststakingaddresses`. */
+export interface StakingAddress {
+  label: string;
+  address: string;
+  [key: string]: unknown;
+}

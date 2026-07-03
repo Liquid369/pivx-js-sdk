@@ -110,6 +110,27 @@ if (signed.complete) await client.sendRawTransaction(signed.hex);
 structured results (`TransactionInfo`, `ValidateAddress`) rather than opaque
 objects.
 
+v0.5 typed the node-status surface — network, mempool, mining, util, budget,
+and staking — so those return structured objects as well:
+
+```js
+const fee = await client.estimateSmartFee(6);
+console.log(fee.feerate);                 // PIV/kB; -1 when the node has no estimate
+
+const staking = await client.getStakingStatus();
+if (staking.staking_status) console.log('actively staking');
+
+// getRawMempool is overloaded on the verbose flag:
+const txids = await client.getRawMempool();        // string[]
+const entries = await client.getRawMempool(true);  // Record<txid, MempoolEntry>
+for (const [txid, e] of Object.entries(entries)) console.log(txid, e.fee);
+```
+
+Each typed status result also carries an index signature, so a field a newer
+node adds is preserved rather than dropped. `getMasternodeStatus`,
+`masternodeCurrent`, and `listMasternodes` stay raw JSON on purpose — their
+shape is polymorphic.
+
 Anything still not wrapped goes through `call`, which takes the method name
 and positional params exactly as `pivx-cli` would:
 

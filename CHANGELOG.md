@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-03
+
+### Added
+
+- `pivx-rpc`: typed return values for 12 methods that previously returned raw
+  JSON — `getNetworkInfo`, `getPeerInfo`, `getMempoolInfo`, `getRawMempool`
+  (overloaded: `string[]`, or a typed entry map when verbose), `getSupplyInfo`,
+  `getBlockIndexStats`, `getMiningInfo`, `estimateSmartFee`, `getBudgetInfo`,
+  `getBudgetProjection`, `getStakingStatus`, `listStakingAddresses`. Each type
+  keeps an open index signature so unmodeled node fields are preserved.
+
+### Changed
+
+- `pivx-rpc`: the three masternode methods (`getMasternodeStatus`,
+  `masternodeCurrent`, `listMasternodes`) stay raw JSON on purpose — their
+  shape is polymorphic (object, array, or a bare string) and cannot be typed
+  safely.
+
+### Notes
+
+- `pivx-rpc` is at 0.4.0 (its own semver); `pivx-wallet` 0.3.2 tracks the rpc
+  dependency bump. Return-type changes are breaking, hence the rpc minor bump.
+
 ## [0.4.0] - 2026-07-03
 
 ### Added

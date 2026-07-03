@@ -1,9 +1,18 @@
 import type {
   BlockchainInfo,
   BlockHeader,
+  BlockIndexStats,
+  BudgetProjection,
+  BudgetProposal,
   ChainTip,
   DecodedTransaction,
+  EstimateSmartFee,
   ListSinceBlock,
+  MempoolEntry,
+  MempoolInfo,
+  MiningInfo,
+  NetworkInfo,
+  PeerInfo,
   PrevTx,
   ReceivedShieldNote,
   ShieldNote,
@@ -11,6 +20,9 @@ import type {
   ShieldSendSource,
   ShieldTxView,
   SignRawTransactionResult,
+  StakingAddress,
+  StakingStatus,
+  SupplyInfo,
   TransactionInfo,
   TxInput,
   TxOut,
@@ -495,17 +507,23 @@ export class PivxClient {
     return this.call<number>('getmasternodecount');
   }
 
-  /** Legacy masternode list; filter matches address/txhash/status/etc. */
+  /** Legacy masternode list; filter matches address/txhash/status/etc.
+   * Left untyped: returns the node's raw JSON; shape varies (deterministic vs
+   * legacy) and can be a bare string on edge cases. */
   listMasternodes(filter?: string) {
     return this.call<unknown[]>('listmasternodes', filter);
   }
 
-  /** This node's masternode status (errors if the node isn't a masternode). */
+  /** This node's masternode status (errors if the node isn't a masternode).
+   * Left untyped: returns the node's raw JSON; shape varies (deterministic vs
+   * legacy) and can be a bare string on edge cases. */
   getMasternodeStatus() {
     return this.call<Record<string, unknown>>('getmasternodestatus');
   }
 
-  /** The masternode currently scheduled to be paid. */
+  /** The masternode currently scheduled to be paid.
+   * Left untyped: returns the node's raw JSON; shape varies (deterministic vs
+   * legacy) and can be a bare string on edge cases. */
   masternodeCurrent() {
     return this.call<Record<string, unknown>>('masternodecurrent');
   }
@@ -521,21 +539,21 @@ export class PivxClient {
 
   /** Budget proposal(s); name limits the result to one proposal. */
   getBudgetInfo(name?: string) {
-    return this.call<unknown[]>('getbudgetinfo', name);
+    return this.call<BudgetProposal[]>('getbudgetinfo', name);
   }
 
   getBudgetProjection() {
-    return this.call<unknown[]>('getbudgetprojection');
+    return this.call<BudgetProjection[]>('getbudgetprojection');
   }
 
   // ── Staking / cold-staking ──────────────────────────────────────────────────────
 
   getStakingStatus() {
-    return this.call<Record<string, unknown>>('getstakingstatus');
+    return this.call<StakingStatus>('getstakingstatus');
   }
 
   listStakingAddresses() {
-    return this.call<unknown[]>('liststakingaddresses');
+    return this.call<StakingAddress[]>('liststakingaddresses');
   }
 
   getColdStakingBalance() {
@@ -545,7 +563,7 @@ export class PivxClient {
   // ── Network / mempool / mining / util ─────────────────────────────────────────
 
   getPeerInfo() {
-    return this.call<unknown[]>('getpeerinfo');
+    return this.call<PeerInfo[]>('getpeerinfo');
   }
 
   getConnectionCount() {
@@ -553,16 +571,18 @@ export class PivxClient {
   }
 
   getNetworkInfo() {
-    return this.call<Record<string, unknown>>('getnetworkinfo');
+    return this.call<NetworkInfo>('getnetworkinfo');
   }
 
   getMempoolInfo() {
-    return this.call<Record<string, unknown>>('getmempoolinfo');
+    return this.call<MempoolInfo>('getmempoolinfo');
   }
 
-  /** verbose false = array of txids, true = object keyed by txid. */
-  getRawMempool(verbose?: boolean) {
-    return this.call<string[] | Record<string, unknown>>('getrawmempool', verbose);
+  /** verbose false (default) → array of txids; true → object keyed by txid. */
+  getRawMempool(verbose?: false): Promise<string[]>;
+  getRawMempool(verbose: true): Promise<Record<string, MempoolEntry>>;
+  getRawMempool(verbose = false): Promise<string[] | Record<string, MempoolEntry>> {
+    return this.call<string[] | Record<string, MempoolEntry>>('getrawmempool', verbose);
   }
 
   /** Estimated fee-per-kB for confirmation within nblocks; -1 if unknown. */
@@ -572,11 +592,11 @@ export class PivxClient {
 
   /** { feerate, blocks }; feerate is -1 if not enough data. */
   estimateSmartFee(nblocks: number) {
-    return this.call<Record<string, unknown>>('estimatesmartfee', nblocks);
+    return this.call<EstimateSmartFee>('estimatesmartfee', nblocks);
   }
 
   getMiningInfo() {
-    return this.call<Record<string, unknown>>('getmininginfo');
+    return this.call<MiningInfo>('getmininginfo');
   }
 
   /** True if signature is a valid signing of message by address. */
@@ -586,11 +606,11 @@ export class PivxClient {
 
   /** Coin supply totals (transparent + shield). forceUpdate recomputes. */
   getSupplyInfo(forceUpdate?: boolean) {
-    return this.call<Record<string, unknown>>('getsupplyinfo', forceUpdate);
+    return this.call<SupplyInfo>('getsupplyinfo', forceUpdate);
   }
 
   /** Aggregate stats over `range` blocks ending at `height`. */
   getBlockIndexStats(height: number, range: number) {
-    return this.call<Record<string, unknown>>('getblockindexstats', height, range);
+    return this.call<BlockIndexStats>('getblockindexstats', height, range);
   }
 }

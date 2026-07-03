@@ -454,3 +454,121 @@ test('listSinceBlock() omitted sends no params; with a hash sends all three', as
     node.close();
   }
 });
+
+test('getNetworkInfo typed: present optional, absent optional, extra field survives index signature', async () => {
+  const node = await stubNode({
+    getnetworkinfo: () => ({
+      result: {
+        version: 5060000, subversion: '/PIVX Core:5.6.0/', protocolversion: 70926,
+        timeoffset: 0, connections: 8, // localservices/networkactive absent (optional)
+        networks: [{ name: 'ipv4', limited: false, reachable: true, proxy: '', proxy_randomize_credentials: false }],
+        relayfee: 0.00001, localaddresses: [], warnings: '',
+        future_field: 'survives', // unknown extra: must pass through the [key]: unknown index signature
+      },
+    }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const info = await client.getNetworkInfo();
+    assert.equal(info.version, 5060000);
+    assert.equal(info.connections, 8);            // present optional
+    assert.equal(info.localservices, undefined);  // absent optional
+    assert.equal(info.networks[0].name, 'ipv4');  // typed nested array element
+    assert.equal(info.future_field, 'survives');  // extra field survives
+  } finally {
+    node.close();
+  }
+});
+
+test('estimateSmartFee typed: -1 feerate sentinel when there is not enough data', async () => {
+  const node = await stubNode({
+    estimatesmartfee: (p) => ({ result: p[0] > 100 ? { feerate: -1, blocks: p[0] } : { feerate: 0.0002, blocks: p[0] } }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const none = await client.estimateSmartFee(1000);
+    assert.equal(none.feerate, -1);   // sentinel: no estimate
+    assert.equal(none.blocks, 1000);
+    const ok = await client.estimateSmartFee(6);
+    assert.equal(ok.feerate, 0.0002);
+  } finally {
+    node.close();
+  }
+});
+
+test('getBlockIndexStats typed: space-separated keys and string money fields', async () => {
+  const node = await stubNode({
+    getblockindexstats: () => ({
+      result: {
+        'Starting block': 100, 'Ending block': 200,
+        txcount: 50, txcount_all: 60, txbytes: 12345,
+        ttlfee: '0.01234567', feeperkb: '0.00010000', // money STRINGS, not numbers
+        extra_metric: 7, // unknown extra survives
+      },
+    }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const s = await client.getBlockIndexStats(200, 100);
+    assert.deepEqual(node.requests[0].body.params, [200, 100]);
+    assert.equal(s['Starting block'], 100);   // quoted space-key property
+    assert.equal(s['Ending block'], 200);
+    assert.equal(typeof s.ttlfee, 'string');   // money is a string
+    assert.equal(s.ttlfee, '0.01234567');
+    assert.equal(typeof s.feeperkb, 'string');
+    assert.equal(s.extra_metric, 7);           // extra field survives
+  } finally {
+    node.close();
+  }
+});
+
+test('getRawMempool: txid array (non-verbose) and keyed MempoolEntry objects (verbose)', async () => {
+  const node = await stubNode({
+    getrawmempool: (p) => (p[0] === true
+      ? ({
+          result: {
+            abc: {
+              size: 200, fee: 0.0001, modifiedfee: 0.0001, time: 1700000000, height: 1000,
+              descendantcount: 1, descendantsize: 200, descendantfees: 10000, depends: [],
+            },
+          },
+        })
+      : ({ result: ['abc', 'def'] })),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const ids = await client.getRawMempool();          // non-verbose overload → string[]
+    assert.deepEqual(ids, ['abc', 'def']);
+    const verbose = await client.getRawMempool(true);  // verbose overload → Record<string, MempoolEntry>
+    assert.equal(verbose.abc.size, 200);
+    assert.equal(verbose.abc.descendantfees, 10000);   // raw satoshis (integer), not PIV
+    assert.equal(verbose.abc.depends.length, 0);
+  } finally {
+    node.close();
+  }
+});
+
+test('getBudgetInfo typed: PascalCase keys, absent optional IsInvalidReason, extra field survives', async () => {
+  const node = await stubNode({
+    getbudgetinfo: () => ({
+      result: [{
+        Name: 'proposal1', URL: 'https://x', Hash: 'h', FeeHash: 'fh',
+        BlockStart: 100, BlockEnd: 200, TotalPaymentCount: 3, RemainingPaymentCount: 2,
+        PaymentAddress: 'DAddr', Ratio: 1, Yeas: 10, Nays: 1, Abstains: 0,
+        TotalPayment: 300, MonthlyPayment: 100, IsEstablished: true, IsValid: true,
+        Allotted: 100, ExtraKey: 'kept', // IsInvalidReason absent (optional)
+      }],
+    }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const budgets = await client.getBudgetInfo();
+    assert.equal(budgets.length, 1);
+    assert.equal(budgets[0].Name, 'proposal1');          // PascalCase key
+    assert.equal(budgets[0].MonthlyPayment, 100);
+    assert.equal(budgets[0].IsInvalidReason, undefined); // absent optional
+    assert.equal(budgets[0].ExtraKey, 'kept');           // extra field survives
+  } finally {
+    node.close();
+  }
+});
