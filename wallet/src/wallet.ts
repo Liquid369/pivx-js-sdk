@@ -414,6 +414,27 @@ export class PivxWallet {
         }
         return block;
       };
+      // Stale-tip reorg detection: when lastProcessedBlock === tip the batch
+      // loop below never runs, so its per-batch root check never fires. A
+      // same-height reorg (block N replaced while the tip stays N) changes the
+      // shielded set's root but not the height. The tree can't be cheaply
+      // rewound, so re-verify the tip's finalsaplingroot against our local
+      // commitment root — the same localRoot-vs-nodeRoot check the batch loop
+      // does — and diverge on mismatch (caller recovers via reloadFromCheckpoint).
+      // Skip when nothing has been scanned past the checkpoint (a fresh wallet
+      // still on its bundled checkpoint has no tree of its own to check).
+      if (this.lastProcessedBlock === tip) {
+        const [checkpoint] = this.shield.get_closest_checkpoint(this.lastProcessedBlock, this.isTestnet) as [
+          number,
+          string,
+        ];
+        if (this.lastProcessedBlock > checkpoint) {
+          const nodeRoot = (await fetchBlock(tip)).finalsaplingroot;
+          if (!nodeRoot) throw new Error(`node omitted finalsaplingroot at height ${tip}`);
+          const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
+          if (localRoot !== nodeRoot) throw new ScanDivergedError(tip, localRoot, nodeRoot);
+        }
+      }
       while (this.lastProcessedBlock < tip) {
         throwIfAborted(); // batch boundary: nothing applied yet, state consistent
         const from = this.lastProcessedBlock + 1;
@@ -605,40 +626,44 @@ export class PivxWallet {
       }
     }
 
-    // Spendable notes, minus pending spends and dust. Dust notes (worth no
-    // more than their own input fee) can never help cover amount+fee and only
-    // let an attacker inflate the fee, so they are excluded from spending.
-    const pending = new Set([...this.pendingSpends.values()].flat());
-    const spendable = this.notes.filter(
-      (n) => !pending.has(n.nullifier) && n.note.value > DUST_NOTE_SATS,
-    );
-
-    // Refuse a send the inputs can't cover including the fee, unless the
-    // caller opts into sweep. Both branches mirror the Rust selection so the
-    // WASM can't silently pay the fee out of the recipient's amount — the
-    // WASM shares the same fee model but has no such guard.
-    const sufficient = useShield
-      ? estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to)).sufficient
-      : estimateTransparentSelection(
-          opts.inputs as TransparentInput[],
-          opts.amount,
-          this.isShieldAddress(opts.to),
-        ).sufficient;
-    if (!sufficient && !opts.sweep) {
-      throw new Error(
-        'insufficient input value to cover amount + fee; lower the amount, ' +
-          'add inputs, or pass sweep:true to deduct the fee from the recipient',
-      );
-    }
-
-    // Prover is only needed to build; check it after the cheap validations
-    // so callers get input errors without loading ~50MB of parameters.
-    if (!(await this.shield.prover_is_loaded())) {
-      throw new Error('sapling prover not loaded: call loadProver() first');
-    }
+    // Acquire the single-writer guard BEFORE snapshotting spendable notes or
+    // awaiting anything. Otherwise two concurrent createTransaction calls could
+    // each snapshot the same notes before either set `busy`, then serialize on
+    // the guard and both build with the same inputs — a double-spend.
     if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
     this.busy = true;
     try {
+      // Spendable notes, minus pending spends and dust. Dust notes (worth no
+      // more than their own input fee) can never help cover amount+fee and only
+      // let an attacker inflate the fee, so they are excluded from spending.
+      const pending = new Set([...this.pendingSpends.values()].flat());
+      const spendable = this.notes.filter(
+        (n) => !pending.has(n.nullifier) && n.note.value > DUST_NOTE_SATS,
+      );
+
+      // Refuse a send the inputs can't cover including the fee, unless the
+      // caller opts into sweep. Both branches mirror the Rust selection so the
+      // WASM can't silently pay the fee out of the recipient's amount — the
+      // WASM shares the same fee model but has no such guard.
+      const sufficient = useShield
+        ? estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to)).sufficient
+        : estimateTransparentSelection(
+            opts.inputs as TransparentInput[],
+            opts.amount,
+            this.isShieldAddress(opts.to),
+          ).sufficient;
+      if (!sufficient && !opts.sweep) {
+        throw new Error(
+          'insufficient input value to cover amount + fee; lower the amount, ' +
+            'add inputs, or pass sweep:true to deduct the fee from the recipient',
+        );
+      }
+
+      // Prover is only needed to build; check it after the cheap validations
+      // so callers get input errors without loading ~50MB of parameters.
+      if (!(await this.shield.prover_is_loaded())) {
+        throw new Error('sapling prover not loaded: call loadProver() first');
+      }
       const changeAddress = useShield ? this.getNewAddress() : opts.transparentChangeAddress!;
 
       const result = (await this.shield.create_transaction({

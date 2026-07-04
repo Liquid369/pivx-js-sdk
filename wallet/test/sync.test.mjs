@@ -106,3 +106,61 @@ test('sync fails loudly when the node sapling root diverges', async () => {
     node.close();
   }
 });
+
+// Advance a wallet to the tip by scanning the fixture, so lastProcessedBlock
+// === tip with a real commitment tree — the stale-tip case the batch loop's
+// per-batch root check can't reach (the loop never runs).
+async function walletAtTip() {
+  const wallet = await PivxWallet.create({ spendingKey: EXTSK, network: 'testnet', birthHeight: BIRTH });
+  wallet.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);
+  wallet['startValidated'] = true; // synthetic stub chain: skip node checkpoint validation
+  return wallet;
+}
+
+test('stale tip (lastProcessed === tip): matching tip root is a clean no-op', async () => {
+  const goodRoot = await expectedRootAfterFixture();
+  const node = await stubNode(makeHandlers(goodRoot));
+  try {
+    const wallet = await walletAtTip();
+    assert.equal(wallet.getLastSyncedBlock(), BIRTH + 1);
+    const client = new PivxClient({ port: node.port });
+    await wallet.sync(client); // lastProcessed === tip and tip root matches → no throw
+    assert.equal(wallet.getBalance(), 1_000_000_000);
+    assert.equal(wallet.getLastSyncedBlock(), BIRTH + 1);
+  } finally {
+    node.close();
+  }
+});
+
+test('stale tip (lastProcessed === tip): differing tip root throws ScanDiverged; reload recovers', async () => {
+  const goodRoot = await expectedRootAfterFixture();
+  const wallet = await walletAtTip();
+
+  // A same-height reorg changed the shielded set: the node's tip root differs
+  // from our local one though the height is unchanged.
+  const badNode = await stubNode(makeHandlers('00'.repeat(32)));
+  try {
+    const client = new PivxClient({ port: badNode.port });
+    await assert.rejects(wallet.sync(client), ScanDivergedError);
+    // The guard throws before the batch loop; no state was mutated.
+    assert.equal(wallet.getLastSyncedBlock(), BIRTH + 1);
+    assert.equal(wallet.getBalance(), 1_000_000_000);
+  } finally {
+    badNode.close();
+  }
+
+  // Recovery: reset to the checkpoint (drops notes), then resync a healthy node.
+  wallet.reloadFromCheckpoint(BIRTH);
+  assert.equal(wallet.getBalance(), 0);
+  const goodNode = await stubNode(makeHandlers(goodRoot));
+  try {
+    wallet['lastProcessedBlock'] = BIRTH; // model the stub's one-block-past-checkpoint chain
+    wallet['startValidated'] = true;
+    const client = new PivxClient({ port: goodNode.port });
+    await wallet.sync(client);
+    assert.equal(wallet.getBalance(), 1_000_000_000);
+    assert.equal(wallet.getLastSyncedBlock(), BIRTH + 1);
+  } finally {
+    goodNode.close();
+  }
+});

@@ -130,10 +130,12 @@ test('sync with batchSize 0 terminates (clamped to 1)', async () => {
 
 test('sync abort: throws signal.reason at the batch boundary, keeps scanned blocks, releases busy', async () => {
   const w = TransparentWallet.create(new Uint8Array(32).fill(17), 'mainnet', 0, 5);
+  // Honest chain: getBlockHash(h) agrees with the block's own hash field, so a
+  // resume sync's tip check matches and does not trip the reorg walk-back.
   const client = {
     getBlockCount: async () => 4,
-    getBlockHash: async (h) => `hash:${h}`,
-    getBlock: async (hash) => stubBlock(Number(hash.split(':')[1])),
+    getBlockHash: async (h) => stubHash(h),
+    getBlock: async (hash) => stubBlock(parseInt(hash, 16)),
   };
   const ac = new AbortController();
   const reason = new Error('operator stop');
@@ -213,7 +215,7 @@ test('save/load round-trip preserves cursors, scan position, utxos, and pending'
   const s = JSON.parse(json);
   assert.deepEqual(Object.keys(s).sort(), [
     'account', 'gap', 'lastScanned', 'lastScannedHash', 'network',
-    'nextChange', 'nextExternal', 'pending', 'utxos', 'version',
+    'nextChange', 'nextExternal', 'pending', 'scannedHashes', 'utxos', 'version',
   ]);
   assert.equal(s.version, 1);
   assert.equal(s.network, 'mainnet');
@@ -223,6 +225,11 @@ test('save/load round-trip preserves cursors, scan position, utxos, and pending'
   assert.equal(s.nextChange, 1);
   assert.equal(s.lastScanned, 250);
   assert.equal(s.lastScannedHash, 'cd'.repeat(32));
+  // The rolling reorg window round-trips (both scanned blocks, ascending).
+  assert.deepEqual(s.scannedHashes, [
+    { height: 100, hash: 'ab'.repeat(32) },
+    { height: 250, hash: 'cd'.repeat(32) },
+  ]);
   assert.equal(s.utxos.length, 2);
   assert.deepEqual(s.pending, [{ txid: 'aa'.repeat(32), vout: 0 }]);
   // No key material: neither the WIF nor the raw private key of the involved key.
@@ -317,14 +324,104 @@ test('reorg: mismatched previousblockhash throws ScanDivergedError; resetScan re
     w.scanBlock({ height: 100, hash: 'ee'.repeat(32), previousblockhash: 'bb'.repeat(32), tx: [] }));
 });
 
+test('sync resets to the true fork on a within-window reorg: orphan dropped, new chain credited', async () => {
+  const seed = new Uint8Array(32).fill(21);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  // Explicit hashes so getBlockHash(h) and the block's own hash field agree —
+  // the reorg check compares the two, so they must match on an honest chain.
+  const blk = (h, hash, prev, tx = []) => ({ height: h, hash, previousblockhash: prev, tx });
+  const pay = (txid, amt) => [{ txid, vin: [{ txid: 'ff'.repeat(32), vout: 9 }],
+    vout: [{ n: 0, value: amt, scriptPubKey: { hex: spkHex } }] }];
+
+  // Chain A (1..5); block 5 pays us 2 PIV (the deposit a reorg will orphan).
+  let chain = {
+    1: blk(1, 'a1'.repeat(32), '00'.repeat(32)),
+    2: blk(2, 'a2'.repeat(32), 'a1'.repeat(32)),
+    3: blk(3, 'a3'.repeat(32), 'a2'.repeat(32)),
+    4: blk(4, 'a4'.repeat(32), 'a3'.repeat(32)),
+    5: blk(5, 'a5'.repeat(32), 'a4'.repeat(32), pay('11'.repeat(32), 2.0)),
+  };
+  const byHash = () => Object.fromEntries(Object.values(chain).map((b) => [b.hash, b]));
+  let blockFetches = 0;
+  let hashCalls = 0;
+  const client = {
+    getBlockCount: async () => 5,
+    getBlockHash: async (h) => { hashCalls++; return chain[h].hash; },
+    getBlock: async (hash) => { blockFetches++; return byHash()[hash]; },
+  };
+
+  await w.sync(client);
+  assert.equal(w.balance(), 200_000_000); // chain-A deposit credited
+  assert.equal(w.lastScannedBlock(), 5);
+
+  // No-reorg re-sync: exactly one getBlockHash (the tip check) matches the
+  // stored hash → no walk, no reset, no block re-fetch, deposit untouched.
+  blockFetches = 0;
+  hashCalls = 0;
+  await w.sync(client);
+  assert.equal(hashCalls, 1, 'no-reorg re-sync must issue exactly one getBlockHash');
+  assert.equal(blockFetches, 0, 'no-reorg re-sync must not reset or rescan');
+  assert.equal(w.balance(), 200_000_000);
+  assert.equal(w.lastScannedBlock(), 5);
+
+  // Same-height reorg forking at height 3: blocks 4 and 5 are replaced (tip
+  // height stays 5); the replacement block 5 instead pays us 3 PIV.
+  chain = {
+    ...chain,
+    4: blk(4, 'b4'.repeat(32), 'a3'.repeat(32)),
+    5: blk(5, 'b5'.repeat(32), 'b4'.repeat(32), pay('22'.repeat(32), 3.0)),
+  };
+  blockFetches = 0;
+  await w.sync(client);
+  // Reset to the TRUE fork (3), not blindly to lastScanned-100: only blocks 4
+  // and 5 are re-fetched.
+  assert.equal(blockFetches, 2, 'reorg resets to the true fork and rescans only 4..5');
+  assert.equal(w.lastScannedBlock(), 5);
+  assert.equal(w.balance(), 300_000_000); // orphaned 2 PIV gone, new 3 PIV credited
+  assert.equal(w.getUtxos().length, 1);
+});
+
+test('sync throws ScanDivergedError on a reorg deeper than the window (fail-safe)', async () => {
+  const seed = new Uint8Array(32).fill(22);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const TIP = 105; // > REORG_WINDOW (100): the fork lands below the oldest window entry
+  // Per-chain, per-height distinct 64-hex hashes.
+  const H = (c, n) => (c === 'a' ? 'aa' : 'bb') + n.toString(16).padStart(62, '0');
+  let tag = 'a';
+  const client = {
+    getBlockCount: async () => TIP,
+    getBlockHash: async (n) => H(tag, n),
+    getBlock: async (hash) => {
+      const c = hash.startsWith('aa') ? 'a' : 'b';
+      const n = parseInt(hash.slice(2), 16);
+      return { height: n, hash, previousblockhash: H(c, n - 1), tx: [] };
+    },
+  };
+
+  await w.sync(client);
+  assert.equal(w.lastScannedBlock(), TIP);
+
+  // Whole-chain reorg: every height now hashes differently, so no stored window
+  // entry (heights 6..105) matches the node — the fork is beyond the window and
+  // cannot be located, so sync must fail loud instead of silently self-healing.
+  tag = 'b';
+  await assert.rejects(w.sync(client), ScanDivergedError);
+  // State is left intact for the caller to reset from a trusted checkpoint.
+  assert.equal(w.lastScannedBlock(), TIP);
+});
+
 test('concurrent sync throws busy', async () => {
   const w = TransparentWallet.create(new Uint8Array(32).fill(16), 'mainnet', 0, 5);
+  // Honest chain (consistent getBlockHash/hash) so the post-completion re-sync's
+  // tip check matches and does not trip the reorg walk-back.
   const client = {
     getBlockCount: async () => 2,
-    getBlockHash: async (h) => `hash:${h}`,
+    getBlockHash: async (h) => stubHash(h),
     getBlock: async (hash) => {
       await new Promise((r) => setTimeout(r, 10));
-      return stubBlock(Number(hash.split(':')[1]));
+      return stubBlock(parseInt(hash, 16));
     },
   };
   const p1 = w.sync(client);
@@ -337,7 +434,7 @@ test('concurrent sync throws busy', async () => {
 // Cross-SDK state fixture: this exact JSON is what BOTH SDKs' save() must
 // emit for the recipe below (the Rust suite byte-compares the same string).
 // Any change to the state format must update both suites together.
-const CROSS_SDK_STATE = '{"version":1,"network":"mainnet","account":0,"gap":3,"nextExternal":1,"nextChange":1,"lastScanned":7,"lastScannedHash":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","utxos":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0,"amount":123456789,"scriptPubKey":"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac","keyHash":"9fae9617b8665480001546cf2825fcc6465e0c32","coinbase":false,"height":0},{"txid":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","vout":0,"amount":100000000,"scriptPubKey":"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac","keyHash":"9fae9617b8665480001546cf2825fcc6465e0c32","coinbase":true,"height":7}],"pending":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0}]}';
+const CROSS_SDK_STATE = '{"version":1,"network":"mainnet","account":0,"gap":3,"nextExternal":1,"nextChange":1,"lastScanned":7,"lastScannedHash":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","scannedHashes":[{"height":7,"hash":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"}],"utxos":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0,"amount":123456789,"scriptPubKey":"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac","keyHash":"9fae9617b8665480001546cf2825fcc6465e0c32","coinbase":false,"height":0},{"txid":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","vout":0,"amount":100000000,"scriptPubKey":"76a9149fae9617b8665480001546cf2825fcc6465e0c3288ac","keyHash":"9fae9617b8665480001546cf2825fcc6465e0c32","coinbase":true,"height":7}],"pending":[{"txid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vout":0}]}';
 
 test('save() output is byte-identical to the Rust SDK for the shared recipe', () => {
   const seed = new Uint8Array(32).fill(1);

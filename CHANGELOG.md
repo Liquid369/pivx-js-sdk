@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-07-04
+
+### Fixed
+
+- `pivx-wallet`: closed a double-spend race in `createTransaction` — the
+  single-writer guard is now acquired before the spendable-note snapshot and
+  any await, so two concurrent sends can no longer select the same notes.
+- `pivx-wallet`: same-height chain reorgs are now detected. Each sync
+  revalidates the last-scanned block hash; the transparent wallet walks a
+  persisted hash window to the true fork and self-heals (re-scanning), or
+  raises `ScanDivergedError` when the reorg is deeper than the window rather
+  than silently retaining orphaned UTXOs. The shield wallet raises
+  `ScanDivergedError` on a tip sapling-root mismatch (recover with
+  `reloadFromCheckpoint`). Require confirmations before crediting.
+
 ## [0.6.0] - 2026-07-04
 
 ### Added

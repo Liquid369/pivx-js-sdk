@@ -27,6 +27,15 @@ const dustThreshold = (scriptLen: number): number => Math.floor((30_000 * (8 + 1
 /** Coinbase/coinstake maturity in blocks (nCoinbaseMaturity): mainnet 100, testnet 15. */
 const coinbaseMaturity = (network: Network): number => (network === 'mainnet' ? 100 : 15);
 
+/**
+ * Depth of the rolling (height, hash) window kept for reorg recovery. On a
+ * detected same-height tip reorg, sync walks this window newest→oldest to find
+ * the true fork and resets there; a reorg deeper than the window cannot be
+ * located safely and fails loud instead of silently retaining orphaned UTXOs.
+ * Identical in the Rust SDK.
+ */
+const REORG_WINDOW = 100;
+
 /** A tracked unspent transparent output we can spend. */
 export interface OwnedUtxo {
   txid: string;
@@ -83,6 +92,7 @@ export class TransparentWallet {
   private utxos = new Map<string, OwnedUtxo>(); // "txid:vout" → utxo
   private lastScanned = 0; // height of the last block passed to scanBlock
   private lastScannedHash: string | null = null; // hash of that block, for reorg detection
+  private scannedHashes: { height: number; hash: string }[] = []; // rolling window of recent (height, hash) for the reorg walk-back
   private pending = new Set<string>(); // "txid:vout" reserved by buildSend until markSpent/release
   /** One sync at a time (mirrors the shield wallet's busy guard). */
   private busy = false;
@@ -223,6 +233,14 @@ export class TransparentWallet {
       }
     }
     this.lastScannedHash = typeof block.hash === 'string' ? block.hash : null;
+    // Record this block into the rolling reorg window (same usable-hash guard as
+    // lastScannedHash), keeping only the last REORG_WINDOW entries.
+    if (typeof block.hash === 'string') {
+      this.scannedHashes.push({ height, hash: block.hash });
+      if (this.scannedHashes.length > REORG_WINDOW) {
+        this.scannedHashes.splice(0, this.scannedHashes.length - REORG_WINDOW);
+      }
+    }
   }
 
   /** Height of the last block passed to {@link scanBlock} (0 if none). */
@@ -243,8 +261,13 @@ export class TransparentWallet {
         this.pending.delete(k);
       }
     }
+    // Trim the reorg window to the retained span; if the reset height is itself a
+    // known window entry (a true fork), restore its hash so scan continuity is
+    // preserved — otherwise (a manual reset to an unknown height) leave it null.
+    this.scannedHashes = this.scannedHashes.filter((e) => e.height <= height);
+    const retained = this.scannedHashes.find((e) => e.height === height);
     this.lastScanned = height;
-    this.lastScannedHash = null;
+    this.lastScannedHash = retained ? retained.hash : null;
   }
 
   /**
@@ -282,6 +305,35 @@ export class TransparentWallet {
       };
       const concurrency = 8;
       const tip = await client.getBlockCount();
+      // Stale-tip reorg detection: the forward scan only checks parent-hash
+      // continuity for blocks above lastScanned, so a same-height reorg (block N
+      // replaced while the tip stays N) leaves lastScanned == tip and is missed.
+      // Any reorg at/below lastScanned changes that block's hash, so re-verify
+      // the node's current hash for it. On a mismatch, walk the recorded window
+      // newest→oldest to find the true fork (the highest stored height whose
+      // hash the node still confirms) and reset there; the UTXO model self-heals
+      // (resetScan drops UTXOs above the fork and the re-scan re-credits the
+      // survivors). If the reorg is deeper than the window we cannot locate the
+      // fork safely, so fail loud rather than silently retain orphaned UTXOs.
+      // Honest chain = 1 getBlockHash (tip matches → skip the walk).
+      if (this.lastScanned > 0 && this.lastScannedHash !== null) {
+        const nodeTip = await client.getBlockHash(this.lastScanned);
+        if (nodeTip !== this.lastScannedHash) {
+          let fork: number | undefined;
+          for (let i = this.scannedHashes.length - 1; i >= 0; i--) {
+            const entry = this.scannedHashes[i];
+            if ((await client.getBlockHash(entry.height)) === entry.hash) {
+              fork = entry.height;
+              break;
+            }
+          }
+          if (fork !== undefined) {
+            this.resetScan(fork);
+          } else {
+            throw new ScanDivergedError(this.lastScanned, this.lastScannedHash, nodeTip);
+          }
+        }
+      }
       const fetchBlock = async (h: number) => client.getBlock(await client.getBlockHash(h), 2);
       // NaN/0/fractional → sane integer: 0 would loop forever and fractional
       // heights would skip blocks (matches Rust batch.max(1)).
@@ -435,6 +487,9 @@ export class TransparentWallet {
       nextChange: this.nextChange,
       lastScanned: this.lastScanned,
       lastScannedHash: this.lastScannedHash,
+      // Rolling reorg window (ascending by height, newest last). Emitted here —
+      // after lastScannedHash, before utxos — for byte parity with the Rust SDK.
+      scannedHashes: this.scannedHashes.map((e) => ({ height: e.height, hash: e.hash })),
       // Sorted by (txid, vout) so save() output is deterministic and
       // byte-comparable with the Rust SDK's.
       utxos: [...this.utxos.values()]
@@ -490,6 +545,10 @@ export class TransparentWallet {
     if (!Array.isArray(s.utxos) || !Array.isArray(s.pending)) {
       throw new Error('wallet state has invalid utxo or pending lists');
     }
+    // Backward-compatible: older states have no window → treat as empty.
+    if (s.scannedHashes !== undefined && !Array.isArray(s.scannedHashes)) {
+      throw new Error('wallet state has an invalid scanned-hash window');
+    }
     const w = TransparentWallet.create(seed, s.network, s.account, s.gap);
     w.nextExternal = s.nextExternal;
     w.nextChange = s.nextChange;
@@ -530,6 +589,14 @@ export class TransparentWallet {
         throw new Error('wallet state contains a malformed pending entry');
       }
       w.pending.add(`${p.txid}:${p.vout}`);
+    }
+    for (const e of s.scannedHashes ?? []) {
+      // hash is string-checked (not hex-validated), matching lastScannedHash
+      // and the Rust SDK so a state loads in both or neither.
+      if (!isCount(e?.height) || typeof e.hash !== 'string') {
+        throw new Error('wallet state contains a malformed scanned-hash entry');
+      }
+      w.scannedHashes.push({ height: e.height, hash: e.hash });
     }
     return w;
   }

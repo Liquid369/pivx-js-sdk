@@ -59,6 +59,25 @@ test('createTransaction refuses a send the balance cannot cover with fee, unless
   );
 });
 
+test('concurrent createTransaction serializes on the busy guard (no shared snapshot)', async () => {
+  const w = await newWallet();
+  w.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);
+  // Two covered-amount sends fired together: the first acquires the busy guard
+  // before snapshotting notes or awaiting, so the second must see busy and be
+  // rejected — it can never snapshot the same notes and double-spend. (The
+  // first then fails only on the unloaded prover.) Before the guard was moved
+  // ahead of the snapshot/await, both reached the prover check.
+  const results = await Promise.allSettled([
+    w.createTransaction({ to: SHIELD_ADDRESS, amount: 500_000_000 }),
+    w.createTransaction({ to: SHIELD_ADDRESS, amount: 500_000_000 }),
+  ]);
+  const reasons = results.map((r) => String(r.reason?.message ?? ''));
+  assert.equal(results.filter((r) => r.status === 'rejected').length, 2);
+  assert.equal(reasons.filter((m) => /busy/.test(m)).length, 1, 'exactly one rejected as busy');
+  assert.equal(reasons.filter((m) => /prover not loaded/.test(m)).length, 1);
+  assert.equal(w.pendingTransactions ? Object.keys(w.pendingTransactions()).length : 0, 0);
+});
+
 test('createTransaction rejects a non-integer transparent input amount', async () => {
   const w = await newWallet();
   await assert.rejects(
