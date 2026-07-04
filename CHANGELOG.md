@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-04
+
+### Added
+
+- `pivx-rpc`: ZMQ push notifications. `parseZmqFrame` is a pure, dependency-free
+  decoder for pivxd's 3-part multipart message (topics `hashblock`, `hashtx`,
+  `rawblock`, `rawtx`) — bring your own socket. `ZmqSubscriber` is a convenience
+  over the `zeromq` package: `await ZmqSubscriber.connect(endpoint, topics)`
+  yields typed events via async iteration. `zeromq` is NOT a runtime dependency
+  — install it yourself (`npm install zeromq`); it is imported dynamically only
+  when `connect()` runs, so pivx-rpc stays zero-runtime-deps and
+  browser-importable. Typical use: trigger a wallet sync on each new block.
+
 ## [0.5.0] - 2026-07-03
 
 ### Added

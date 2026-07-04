@@ -1,5 +1,14 @@
 export { PivxClient, RpcError, AuthError, type PivxClientOptions } from './client.js';
 export { ShieldWatcher, watchViewingKey, type ShieldWatcherOptions } from './shield.js';
+export {
+  ZmqSubscriber,
+  parseZmqFrame,
+  TOPIC_HASHBLOCK,
+  TOPIC_HASHTX,
+  TOPIC_RAWBLOCK,
+  TOPIC_RAWTX,
+  type ZmqEvent,
+} from './zmq.js';
 export type {
   ShieldNote,
   ReceivedShieldNote,

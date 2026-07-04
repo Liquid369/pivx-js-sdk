@@ -213,6 +213,38 @@ const view = await client.viewShieldTransaction(txid);  // decrypted amounts + m
 The from address can be a specific address or a selector:
 `'from_shield'`, `'from_transparent'`, `'from_trans_cold'`.
 
+### ZMQ push notifications
+
+v0.6 adds ZMQ push notifications: pivxd can push a notification on every new
+block or transaction, so you can trigger a wallet `sync` the moment the chain
+moves instead of polling `ShieldWatcher`. (v0.6.0 ships pivx-rpc 0.5.0.) Launch
+the node with the matching endpoints, e.g.
+`-zmqpubhashblock=tcp://127.0.0.1:28332 -zmqpubrawtx=tcp://127.0.0.1:28332`
+(topics: `hashblock`, `hashtx`, `rawblock`, `rawtx`).
+
+`ZmqSubscriber` owns a SUB socket and yields typed events; iterate it and
+`sync` on each `hashblock`:
+
+```js
+import { ZmqSubscriber } from 'pivx-rpc';
+
+const sub = await ZmqSubscriber.connect('tcp://127.0.0.1:28332', ['hashblock']);
+for await (const ev of sub) {
+  if (ev.topic === 'hashblock') await wallet.sync(client);
+}
+```
+
+The subscriber needs the `zeromq` package (`npm install zeromq`); it is not a
+runtime dependency of `pivx-rpc` and is imported dynamically only when
+`connect()` runs, so the package stays zero-runtime-deps and browser-importable.
+`hashblock`/`hashtx` events carry `ev.hash` (display-order hex); `rawblock`/`rawtx`
+carry the raw bytes as `ev.block` / `ev.tx`; every event carries a little-endian
+`ev.sequence`.
+
+If you already have a socket, skip the subscriber and decode frames yourself
+with the pure, dependency-free `parseZmqFrame(frames)` — it takes the 3-part
+`[topic, body, sequence]` multipart message and returns the same typed event.
+
 ## pivx-wallet
 
 ### Creating a wallet
