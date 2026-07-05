@@ -506,3 +506,54 @@ test('sync rejects a block missing hash/previousblockhash instead of scanning pa
   };
   await assert.rejects(w.sync(client), /without hash\/previousblockhash/);
 });
+
+// Finding 2: buildSend is synchronous but can run in the event-loop gap while a
+// sync is suspended on an RPC await; selecting a UTXO an in-flight reorg reset
+// is about to drop would broadcast a spend of an orphaned output. The busy
+// guard (the one sync sets) refuses buildSend while a sync holds it.
+test('buildSend refuses to run while a sync is in progress (busy guard)', () => {
+  const seed = new Uint8Array(32).fill(18);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  w.addUtxo('aa'.repeat(32), 0, 200_000_000, scriptPubKeyForAddress(a0.address));
+  w['busy'] = true; // a sync holds the guard (set before its first RPC await)
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, 100), /busy/);
+  w['busy'] = false; // guard released → selection proceeds normally
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 100));
+});
+
+// Finding 3: honest save() output is ascending, unique, ≤ REORG_WINDOW entries,
+// all heights ≤ lastScanned. load must reject any window that violates this, so
+// the reorg walk-back (which trusts array order and heights) can't be misled.
+test('load rejects a future / non-ascending / oversized scannedHashes window', () => {
+  const seed = new Uint8Array(32).fill(1);
+  const base = JSON.parse(CROSS_SDK_STATE); // lastScanned 7, one window entry at 7
+  const hashOf = (n) => n.toString(16).padStart(2, '0').repeat(32);
+  const withState = (o) => JSON.stringify({ ...base, ...o });
+
+  // Future entry: height above lastScanned (7).
+  assert.throws(
+    () => TransparentWallet.load(seed, withState({ scannedHashes: [{ height: 8, hash: hashOf(8) }] })),
+    /invalid scanned-hash window/,
+  );
+  // Duplicate height (not strictly ascending).
+  assert.throws(
+    () => TransparentWallet.load(seed, withState({ scannedHashes: [{ height: 7, hash: hashOf(7) }, { height: 7, hash: hashOf(0) }] })),
+    /invalid scanned-hash window/,
+  );
+  // Descending heights.
+  assert.throws(
+    () => TransparentWallet.load(seed, withState({ scannedHashes: [{ height: 6, hash: hashOf(6) }, { height: 5, hash: hashOf(5) }] })),
+    /invalid scanned-hash window/,
+  );
+  // Longer than REORG_WINDOW (100): 101 ascending, in-range entries — only the
+  // length rule fails (lastScanned bumped so heights stay ≤ it).
+  const long = Array.from({ length: 101 }, (_, i) => ({ height: i, hash: hashOf(i % 256) }));
+  assert.throws(
+    () => TransparentWallet.load(seed, withState({ lastScanned: 200, scannedHashes: long })),
+    /invalid scanned-hash window/,
+  );
+
+  // An honest window still loads (regression guard).
+  assert.doesNotThrow(() => TransparentWallet.load(seed, CROSS_SDK_STATE));
+});

@@ -14,9 +14,12 @@ import type {
 /** PIVX BIP44 coin types. */
 const COIN_TYPE = { mainnet: 119, testnet: 1 } as const;
 
-/** Heights at/after which a block must carry a sapling root. Below these,
- * the node legitimately has none. */
-const SAPLING_ACTIVATION = { mainnet: 2_700_000, testnet: 43_200 } as const;
+/** Threshold at/above which the sapling root check runs; below it we skip. These
+ * are the exact UPGRADE_V5_0 activation heights (inclusive) from PIVX consensus,
+ * so at/above them an honest node always reports a real, matchable
+ * finalsaplingroot, and below them (no shielded txs yet) there is nothing to
+ * verify. Mainnet V5_0 is 2_700_500; testnet is 201. */
+const SAPLING_ACTIVATION = { mainnet: 2_700_500, testnet: 201 } as const;
 
 /** A note worth no more than its own input fee (sapling input 384 bytes ×
  * 1000 sats/byte) never helps cover amount+fee, so it is never spent. */
@@ -421,16 +424,20 @@ export class PivxWallet {
       // rewound, so re-verify the tip's finalsaplingroot against our local
       // commitment root — the same localRoot-vs-nodeRoot check the batch loop
       // does — and diverge on mismatch (caller recovers via reloadFromCheckpoint).
-      // Skip when nothing has been scanned past the checkpoint (a fresh wallet
-      // still on its bundled checkpoint has no tree of its own to check).
+      // Runs even at an exact checkpoint height: a fresh wallet still on its
+      // bundled checkpoint matches the node's finalsaplingroot there (that is
+      // what a checkpoint is, and ensureValidCheckpoint already confirmed it),
+      // so it is a clean no-op — while a wallet that scanned up to a checkpoint
+      // height and was then same-height reorged finally gets the check it was
+      // missing. Route the fetch through nodeSaplingRoot so it is skipped below
+      // the SAPLING_ACTIVATION threshold: below real V5_0 the node reports a
+      // zero root our non-zero empty tree can't match, so an honest wallet would
+      // false-diverge — the same activation exception ensureValidCheckpoint
+      // relies on. nodeSaplingRoot's verbosity-1 getblock returns
+      // finalsaplingroot without the full tx list the batch fetchBlock needs.
       if (this.lastProcessedBlock === tip) {
-        const [checkpoint] = this.shield.get_closest_checkpoint(this.lastProcessedBlock, this.isTestnet) as [
-          number,
-          string,
-        ];
-        if (this.lastProcessedBlock > checkpoint) {
-          const nodeRoot = (await fetchBlock(tip)).finalsaplingroot;
-          if (!nodeRoot) throw new Error(`node omitted finalsaplingroot at height ${tip}`);
+        const nodeRoot = await this.nodeSaplingRoot(client, tip);
+        if (nodeRoot !== null) {
           const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
           if (localRoot !== nodeRoot) throw new ScanDivergedError(tip, localRoot, nodeRoot);
         }
@@ -463,13 +470,23 @@ export class PivxWallet {
             })),
           );
 
-          const nodeRoot = blocks[blocks.length - 1].finalsaplingroot;
-          // A shielded chain always has a sapling root; a missing one means
-          // the node is pre-activation or lying. Either way, refuse to
-          // advance unverified.
-          if (!nodeRoot) throw new Error(`node omitted finalsaplingroot at height ${to}`);
-          const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
-          if (localRoot !== nodeRoot) throw new ScanDivergedError(to, localRoot, nodeRoot);
+          // Verify the locally-built tree against the node's finalsaplingroot,
+          // except below the SAPLING_ACTIVATION threshold, where we skip: below
+          // real V5_0 the node reports a zero root our non-zero empty tree can't
+          // match, and no shielded txs exist below activation anyway, so there
+          // is nothing to verify. Both networks can scan into the skip window: a
+          // testnet wallet with a below-activation birth height resumes from the
+          // height-0 empty-tree checkpoint, and a mainnet wallet resumes from
+          // checkpoint 2_700_000 and scans the empty [2_700_001, 2_700_500) gap
+          // below its real activation. Same exception nodeSaplingRoot encodes.
+          if (to >= SAPLING_ACTIVATION[this.network]) {
+            const nodeRoot = blocks[blocks.length - 1].finalsaplingroot;
+            // A shielded chain always has a sapling root; a missing one past
+            // activation means the node is lying. Refuse to advance unverified.
+            if (!nodeRoot) throw new Error(`node omitted finalsaplingroot at height ${to}`);
+            const localRoot = reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
+            if (localRoot !== nodeRoot) throw new ScanDivergedError(to, localRoot, nodeRoot);
+          }
         } catch (err) {
           this.commitmentTree = snapshot.tree;
           this.lastProcessedBlock = snapshot.last;
@@ -486,6 +503,25 @@ export class PivxWallet {
   }
 
   /**
+   * The node's finalsaplingroot at height h, or null below the SAPLING_ACTIVATION
+   * threshold — below real V5_0 the node reports a zero root our non-zero empty
+   * tree can't match, so returning null signals "skip the check". At/above the
+   * threshold the node must report one; treating an omitted root as "no root"
+   * would let a node suppress the check or force an all-the-way rewind by simply
+   * withholding the field.
+   */
+  private async nodeSaplingRoot(client: PivxClient, h: number): Promise<string | null> {
+    if (h < SAPLING_ACTIVATION[this.network]) return null;
+    const block = (await client.getBlock(await client.getBlockHash(h), 1)) as {
+      finalsaplingroot?: string;
+    };
+    if (!block.finalsaplingroot) {
+      throw new Error(`node omitted finalsaplingroot at height ${h} (past sapling activation)`);
+    }
+    return block.finalsaplingroot;
+  }
+
+  /**
    * Confirm the starting commitment tree against the node before scanning
    * forward. A fresh wallet begins at a bundled checkpoint; if that
    * checkpoint's tree does not match the node's sapling root at that height
@@ -496,23 +532,9 @@ export class PivxWallet {
    */
   private async ensureValidCheckpoint(client: PivxClient): Promise<void> {
     if (this.startValidated) return;
-    const activation = SAPLING_ACTIVATION[this.network];
-    // Sapling root at height h. Above activation the node must report one;
-    // treating an omitted root as "no root" would let a node suppress this
-    // check or force an all-the-way rewind by simply withholding the field.
-    const rootAt = async (h: number): Promise<string | null> => {
-      if (h < activation) return null;
-      const block = (await client.getBlock(await client.getBlockHash(h), 1)) as {
-        finalsaplingroot?: string;
-      };
-      if (!block.finalsaplingroot) {
-        throw new Error(`node omitted finalsaplingroot at height ${h} (past sapling activation)`);
-      }
-      return block.finalsaplingroot;
-    };
     const localRoot = () => reverseHex(this.shield.get_sapling_root(this.commitmentTree) as string);
 
-    const node = await rootAt(this.lastProcessedBlock);
+    const node = await this.nodeSaplingRoot(client, this.lastProcessedBlock);
     if (node === null || localRoot() === node) {
       this.startValidated = true;
       return;
@@ -540,7 +562,7 @@ export class PivxWallet {
       ];
       if (cpHeight >= lastCp) break; // no older checkpoint available
       lastCp = cpHeight;
-      const nodeRoot = await rootAt(cpHeight);
+      const nodeRoot = await this.nodeSaplingRoot(client, cpHeight);
       const cpRoot = reverseHex(this.shield.get_sapling_root(cpTree) as string);
       if (nodeRoot === null || cpRoot === nodeRoot) {
         this.commitmentTree = cpTree;

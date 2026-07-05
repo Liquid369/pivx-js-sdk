@@ -400,6 +400,12 @@ export class TransparentWallet {
     amount: number,
     feePerByte = 100,
   ): { hex: string; spent: { txid: string; vout: number }[] } {
+    // A sync running in the event-loop gap (suspended on an RPC await) may be
+    // mid-reorg reset; selecting/reserving a UTXO now risks spending an output
+    // resetScan is about to drop. Refuse until the sync releases the guard.
+    // (markSpent/release stay unguarded: removal-only finalization must always
+    // complete, or a reservation leaks.)
+    if (this.busy) throw new Error('wallet is busy: a sync is in progress');
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('amount must be a positive integer (satoshis)');
     if (!Number.isInteger(feePerByte) || feePerByte <= 0) throw new Error('feePerByte must be a positive integer (satoshis/byte)');
     const dest = decodeAddress(to); // throws on an invalid address
@@ -597,6 +603,18 @@ export class TransparentWallet {
         throw new Error('wallet state contains a malformed scanned-hash entry');
       }
       w.scannedHashes.push({ height: e.height, hash: e.hash });
+    }
+    // Honest save() output is ascending, unique, ≤ REORG_WINDOW entries, all
+    // heights ≤ lastScanned. The reorg walk-back trusts array order and entry
+    // heights, so reject anything else rather than let a hostile or corrupt
+    // state mislead it (this also keeps duplicates out of resetScan).
+    if (
+      w.scannedHashes.length > REORG_WINDOW ||
+      w.scannedHashes.some(
+        (e, i) => e.height > w.lastScanned || (i > 0 && e.height <= w.scannedHashes[i - 1].height),
+      )
+    ) {
+      throw new Error('wallet state contains an invalid scanned-hash window');
     }
     return w;
   }
