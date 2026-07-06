@@ -255,13 +255,16 @@ export class PivxClient {
       throw new MalformedResponseError(`${method}: malformed response (expected a JSON object)`);
     }
     const body = parsed as { result?: T; error?: { code: number; message: string } | null; id?: unknown };
-    if (body.error) throw new RpcError(body.error.code, body.error.message, method);
-    if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
+    // pivxd echoes the request id on BOTH success and error replies, so verify
+    // it before either branch: a wrong-id reply is not this call's result *or*
+    // error and must be rejected rather than mis-attributed.
     if (body.id !== id) {
       throw new MalformedResponseError(
         `${method}: response id mismatch (sent ${id}, got ${String(body.id)})`,
       );
     }
+    if (body.error) throw new RpcError(body.error.code, body.error.message, method);
+    if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
     return body.result as T;
   }
 

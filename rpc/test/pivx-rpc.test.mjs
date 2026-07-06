@@ -802,6 +802,24 @@ test('response id mismatch throws a labeled error', async () => {
   }
 });
 
+test('R5-1: id mismatch on an ERROR reply is rejected, not surfaced as the RpcError', async () => {
+  // pivxd echoes the request id on error replies too, so a wrong-id error body
+  // is malformed and must be rejected — not accepted as this call's error.
+  const node = await rawNode(
+    JSON.stringify({ id: 424242, result: null, error: { code: -1, message: 'boom' } }),
+  );
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(client.call('getblockcount'), (err) => {
+      assert.ok(err instanceof MalformedResponseError, 'must be MalformedResponseError, not RpcError');
+      assert.match(err.message, /getblockcount: response id mismatch/);
+      return true;
+    });
+  } finally {
+    node.close();
+  }
+});
+
 test('money-bearing methods reject mistyped results with labeled errors', async () => {
   const node = await stubNode({
     getbalance: () => ({ result: '1.5' }),

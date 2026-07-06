@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   TransparentWallet,
   ScanDivergedError,
+  WalletBusyError,
+  InsufficientFundsError,
   buildTransparentTx,
   deriveKey,
   scriptPubKeyForAddress,
@@ -67,6 +69,32 @@ test('insufficient balance throws', () => {
   const a0 = deriveKey(new Uint8Array(32).fill(4), 'mainnet', 0, 0, 0);
   w.addUtxo('cc'.repeat(32), 0, 1000, scriptPubKeyForAddress(a0.address));
   assert.throws(() => w.buildSend(a0.address, 100_000_000, 100), /insufficient/);
+});
+
+// R5-4: the transparent wallet throws the same typed errors as the shield
+// wallet — InsufficientFundsError when inputs can't cover amount+fee, and
+// WalletBusyError while a sync holds the guard — both still `instanceof Error`.
+// FAILS before (bare Error / no import), PASSES after.
+test('R5-4: transparent over-amount → InsufficientFundsError; busy → WalletBusyError (instanceof Error)', async () => {
+  const w = TransparentWallet.create(new Uint8Array(32).fill(4), 'mainnet', 0, 5);
+  const a0 = deriveKey(new Uint8Array(32).fill(4), 'mainnet', 0, 0, 0);
+  w.addUtxo('cc'.repeat(32), 0, 1000, scriptPubKeyForAddress(a0.address));
+
+  // Over-amount (balance 1000 sats, want 1 PIV) → InsufficientFundsError.
+  const insufficient = (() => {
+    try { w.buildSend(a0.address, 100_000_000, 100); return null; } catch (e) { return e; }
+  })();
+  assert.ok(insufficient instanceof InsufficientFundsError && insufficient instanceof Error, 'InsufficientFundsError');
+
+  // A sync holding the busy guard: buildSend and a concurrent sync both → WalletBusyError.
+  w['busy'] = true;
+  const busyBuild = (() => {
+    try { w.buildSend(a0.address, 100, 100); return null; } catch (e) { return e; }
+  })();
+  assert.ok(busyBuild instanceof WalletBusyError && busyBuild instanceof Error, 'buildSend WalletBusyError');
+  // sync's busy check runs before any client use, so a dummy client is fine.
+  await assert.rejects(w.sync({}), (e) => e instanceof WalletBusyError && e instanceof Error);
+  w['busy'] = false;
 });
 
 test('rejects wrong-network destination, dust amount, and bad fee', () => {

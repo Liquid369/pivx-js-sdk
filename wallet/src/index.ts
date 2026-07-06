@@ -4,6 +4,8 @@ export {
   ScanDivergedError,
   InsufficientFundsError,
   WalletBusyError,
+  ProverNotLoadedError,
+  InvalidKeyError,
 } from './wallet.js';
 export {
   deriveKey,

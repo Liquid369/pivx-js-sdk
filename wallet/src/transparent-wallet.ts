@@ -15,7 +15,7 @@
 import type { PivxClient } from 'pivx-rpc';
 import { decodeAddress, deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
 import { buildTransparentTx, scriptPubKeyForAddress, type TxInput } from './transparent-tx.js';
-import { ScanDivergedError } from './wallet.js';
+import { InsufficientFundsError, ScanDivergedError, WalletBusyError } from './wallet.js';
 
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
 const fromHex = (s: string): Uint8Array => Uint8Array.from((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
@@ -356,7 +356,7 @@ export class TransparentWallet {
       signal?: AbortSignal;
     } = {},
   ): Promise<void> {
-    if (this.busy) throw new Error('wallet is busy: another sync is in progress');
+    if (this.busy) throw new WalletBusyError();
     this.busy = true;
     try {
       const throwIfAborted = () => {
@@ -490,7 +490,7 @@ export class TransparentWallet {
     // resetScan is about to drop. Refuse until the sync releases the guard.
     // (markSpent/release stay unguarded: removal-only finalization must always
     // complete, or a reservation leaks.)
-    if (this.busy) throw new Error('wallet is busy: a sync is in progress');
+    if (this.busy) throw new WalletBusyError();
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('amount must be a positive integer (satoshis)');
     // Below 10 sat/byte the node will not relay the tx: minRelayTxFee is
     // 10000 sat/kB (PIVX src/validation.cpp).
@@ -539,7 +539,7 @@ export class TransparentWallet {
     // An absurd feePerByte can push the fee past exact-integer range, making
     // every later comparison unreliable (the Rust SDK errors on u64 overflow).
     if (!Number.isSafeInteger(fee)) throw new Error('fee computation overflows: feePerByte is too large');
-    if (total < amount + fee) throw new Error('insufficient transparent balance to cover amount + fee');
+    if (total < amount + fee) throw new InsufficientFundsError();
     const changeVal = total - amount - fee;
 
     const outputs = [{ address: to, amount }];

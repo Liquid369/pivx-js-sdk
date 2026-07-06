@@ -129,6 +129,27 @@ export class WalletBusyError extends Error {
   }
 }
 
+/** Thrown when a build is attempted before the sapling proving parameters are
+ * loaded. Mirrors Rust's WalletError::ProverNotLoaded; subclasses Error so
+ * existing `instanceof Error` / message catches keep working. */
+export class ProverNotLoadedError extends Error {
+  constructor() {
+    super('sapling prover not loaded: call loadProver() first');
+    this.name = 'ProverNotLoadedError';
+  }
+}
+
+/** Thrown for invalid key material (bad seed length, out-of-range account
+ * index, or a spending key that doesn't match this wallet's viewing key).
+ * Carries the specific message, mirroring Rust's WalletError::InvalidKey(String);
+ * subclasses Error so existing `instanceof Error` catches keep working. */
+export class InvalidKeyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidKeyError';
+  }
+}
+
 /** Thrown when the local commitment tree diverges from the node's sapling root. */
 export class ScanDivergedError extends Error {
   constructor(
@@ -239,12 +260,22 @@ export class PivxWallet {
       // pass the seed through unchanged — a 64-byte seed and its first 32 bytes
       // yield the same spending key.
       if (opts.seed.length !== 32 && opts.seed.length !== 64) {
-        throw new Error('seed must be 32 bytes (raw) or 64 bytes (BIP39)');
+        throw new InvalidKeyError('seed must be 32 bytes (raw) or 64 bytes (BIP39)');
+      }
+      // The ZIP32 account index is hardened-derived, so it must fit below the
+      // hardened boundary (0x80000000, PIVX src/sapling/zip32.h
+      // ZIP32_HARDENED_KEY_LIMIT). The WASM takes an i32/u32 and would silently
+      // wrap an out-of-range value into a different account; reject it first,
+      // mirroring the transparent wallet's hardened-range guard and Rust's
+      // AccountId::try_from (keys.rs).
+      const accountIndex = opts.accountIndex ?? 0;
+      if (!Number.isSafeInteger(accountIndex) || accountIndex < 0 || accountIndex > 0x7fff_ffff) {
+        throw new InvalidKeyError(`account index must be an integer in [0, 2^31-1], got ${accountIndex}`);
       }
       extsk = shield.generate_extended_spending_key_from_seed({
         seed: Array.from(opts.seed),
         coin_type: COIN_TYPE[network],
-        account_index: opts.accountIndex ?? 0,
+        account_index: accountIndex,
       }) as string;
     } else if (opts.spendingKey) {
       extsk = opts.spendingKey;
@@ -286,13 +317,13 @@ export class PivxWallet {
 
   /** Upgrade a watch-only wallet. The key must match the stored viewing key. */
   loadSpendingKey(spendingKey: string): void {
-    if (this.extsk) throw new Error('wallet already has a spending key');
+    if (this.extsk) throw new InvalidKeyError('wallet already has a spending key');
     const derived = this.shield.generate_extended_full_viewing_key(
       spendingKey,
       this.isTestnet,
     ) as string;
     if (derived !== this.extfvk) {
-      throw new Error('spending key does not match this wallet\'s viewing key');
+      throw new InvalidKeyError('spending key does not match this wallet\'s viewing key');
     }
     this.extsk = spendingKey;
   }
@@ -818,7 +849,7 @@ export class PivxWallet {
       // Prover is only needed to build; check it after the cheap validations
       // so callers get input errors without loading ~50MB of parameters.
       if (!(await this.shield.prover_is_loaded())) {
-        throw new Error('sapling prover not loaded: call loadProver() first');
+        throw new ProverNotLoadedError();
       }
       // getNewAddress() advances the shield diversifier cursor, but the
       // create_transaction call below can still throw (prover/recipient error).

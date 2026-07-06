@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-06
+
+Patch from a post-publish audit: `pivx-rpc` 0.7.1, `pivx-wallet` 0.7.1.
+
+### Fixed
+
+- `pivx-rpc`: the JSON-RPC response `id` is now verified before the error
+  branch on single calls, so a wrong-id reply — success or error — is
+  rejected as a malformed response instead of being mis-attributed as this
+  call's error (which, on a broadcast, could otherwise release a pending
+  spend without the real `sendrawtransaction` response having arrived).
+- `pivx-rpc`: `Unspent.address` is typed optional (the node omits it for
+  non-standard scriptPubKeys, matching the Rust SDK's `#[serde(default)]`).
+- `pivx-wallet`: the transparent wallet now throws the typed
+  `WalletBusyError` / `InsufficientFundsError` (previously bare `Error`),
+  matching the shield wallet; `accountIndex` outside `[0, 2^31-1]` is
+  rejected before shield derivation (ZIP32 hardened boundary).
+
+### Added
+
+- `pivx-wallet`: typed `ProverNotLoadedError` and `InvalidKeyError` error
+  classes (thrown for a missing prover, a bad seed length, and a key
+  mismatch), aligning the JS error taxonomy with the Rust SDK's.
+
 ## [0.7.0] - 2026-07-06
 
 Release of a full-repo audit cycle: `pivx-rpc` 0.7.0, `pivx-wallet` 0.7.0.

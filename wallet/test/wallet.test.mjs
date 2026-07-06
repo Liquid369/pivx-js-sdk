@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PivxWallet, NoSpendAuthorityError } from '../dist/index.js';
+import { PivxWallet, NoSpendAuthorityError, InvalidKeyError } from '../dist/index.js';
 import { EXTSK, SHIELD_ADDRESS, TX_HEX } from './fixtures.mjs';
 
 // These tests run the real pivx-shield WASM: real key derivation, real note
@@ -140,6 +140,41 @@ test('save/load round-trip preserves state; spending key is excluded', async () 
 
   // scanning continues from restored state without complaint
   assert.throws(() => restored.handleBlocks([{ height: BIRTH + 1, txs: [] }]), /ascending/);
+});
+
+// R5-7 / R5-2: invalid-key conditions throw a typed InvalidKeyError (a subclass
+// of Error, so existing `instanceof Error` / message catches still work),
+// matching Rust's WalletError::InvalidKey. FAILS before (bare Error / no export),
+// PASSES after.
+test('R5-7/R5-2: invalid-key conditions throw InvalidKeyError (instanceof Error)', async () => {
+  const seed = new Uint8Array(32).fill(7);
+
+  // Wrong seed length (Rust keys.rs InvalidKey twin).
+  const badSeed = await PivxWallet.create({ seed: new Uint8Array(31), network: 'testnet', birthHeight: BIRTH })
+    .then(() => null, (e) => e);
+  assert.ok(badSeed instanceof InvalidKeyError && badSeed instanceof Error, 'seed length → InvalidKeyError');
+
+  // R5-2: accountIndex at/above the ZIP32 hardened boundary (0x80000000,
+  // src/sapling/zip32.h) is rejected before the WASM call; the max valid index
+  // (2^31-1) is accepted. Rust rejects the same via AccountId::try_from.
+  const badAccount = await PivxWallet.create({ seed, network: 'testnet', birthHeight: BIRTH, accountIndex: 2 ** 31 })
+    .then(() => null, (e) => e);
+  assert.ok(badAccount instanceof InvalidKeyError && badAccount instanceof Error, 'accountIndex 2^31 → InvalidKeyError');
+  await assert.doesNotReject(
+    PivxWallet.create({ seed, network: 'testnet', birthHeight: BIRTH, accountIndex: 2 ** 31 - 1 }),
+    'accountIndex 2^31-1 is accepted',
+  );
+
+  // loadSpendingKey already holds a key (Rust wallet.rs InvalidKey twin).
+  const full = await PivxWallet.create({ spendingKey: EXTSK, network: 'testnet', birthHeight: BIRTH });
+  assert.throws(() => full.loadSpendingKey(EXTSK), (e) => e instanceof InvalidKeyError && e instanceof Error);
+
+  // loadSpendingKey with a valid-but-mismatched key: EXTSK decodes fine but
+  // derives a different viewing key than this watch-only wallet's → mismatch.
+  const other = await PivxWallet.create({ seed, network: 'testnet', birthHeight: BIRTH });
+  const otherVk = JSON.parse(other.save()).extfvk;
+  const watch = await PivxWallet.create({ viewingKey: otherVk, network: 'testnet', birthHeight: BIRTH });
+  assert.throws(() => watch.loadSpendingKey(EXTSK), (e) => e instanceof InvalidKeyError && e instanceof Error);
 });
 
 test('handleBlocks rejects non-ascending heights', async () => {

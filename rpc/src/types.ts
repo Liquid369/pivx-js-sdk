@@ -114,7 +114,10 @@ export interface WalletInfo {
 export interface Unspent {
   txid: string;
   vout: number;
-  address: string;
+  /** Absent when the scriptPubKey has no decodable destination — the node
+   * only emits `address` when `ExtractDestination` succeeds (listunspent,
+   * rpcwallet.cpp). */
+  address?: string;
   amount: number;
   confirmations: number;
   spendable: boolean;

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { RpcError } from 'pivx-rpc';
-import { PivxWallet, InsufficientFundsError, WalletBusyError } from '../dist/index.js';
+import { PivxWallet, InsufficientFundsError, WalletBusyError, ProverNotLoadedError } from '../dist/index.js';
 import { EXTSK, TX_HEX, SHIELD_ADDRESS } from './fixtures.mjs';
 
 // Above testnet sapling activation (201): the fixture blocks carry a shielded
@@ -103,6 +103,21 @@ test('A6: typed InsufficientFundsError and WalletBusyError (both instanceof Erro
   assert.ok(busy instanceof WalletBusyError, 'WalletBusyError');
   assert.ok(busy instanceof Error, 'still an Error');
   assert.match(busy.message, /another sync or spend is in progress/, 'consistent busy message');
+});
+
+// R5-7: the prover-not-loaded failure throws a typed ProverNotLoadedError
+// (subclass of Error), matching Rust's WalletError::ProverNotLoaded. FAILS
+// before (bare Error / no export), PASSES after.
+test('R5-7: createTransaction throws ProverNotLoadedError when the prover is unloaded', async () => {
+  const w = await newWallet();
+  w.handleBlocks([{ height: BIRTH + 1, txs: [{ hex: TX_HEX, txid: 'fixture' }] }]);
+  // A covered amount passes the funds guard and reaches the (unloaded) prover check.
+  const err = await w
+    .createTransaction({ to: SHIELD_ADDRESS, amount: 500_000_000 })
+    .then(() => null, (e) => e);
+  assert.ok(err instanceof ProverNotLoadedError, 'ProverNotLoadedError');
+  assert.ok(err instanceof Error, 'still an Error');
+  assert.match(err.message, /prover not loaded/, 'message preserved');
 });
 
 test('concurrent createTransaction serializes on the busy guard (no shared snapshot)', async () => {
