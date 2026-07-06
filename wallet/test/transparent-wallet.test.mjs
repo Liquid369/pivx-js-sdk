@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   TransparentWallet,
   ScanDivergedError,
+  buildTransparentTx,
   deriveKey,
   scriptPubKeyForAddress,
   p2pkhAddress,
@@ -480,6 +481,27 @@ test('load rejects hostile states', () => {
   assert.throws(() => TransparentWallet.load(seed, CROSS_SDK_STATE.replace('123456789', '9007199254740993')));
 });
 
+// A4: the Rust SDK deserializes vout as u32, so JS load() must cap vout at
+// 0xffffffff — otherwise a state with vout in (2^32, 2^53) would load in JS but
+// not Rust. FAILS before (isCount accepted up to 2^53-1), PASSES after.
+test('A4: load caps vout at 0xffffffff to match Rust u32 (loads in both or neither)', () => {
+  const seed = new Uint8Array(32).fill(1);
+  // utxo vout = 2^32 rejected.
+  assert.throws(
+    () => TransparentWallet.load(seed, CROSS_SDK_STATE.replace('"vout":0,"amount":123456789', '"vout":4294967296,"amount":123456789')),
+    /malformed utxo/,
+  );
+  // pending vout = 2^32 rejected (the pending entry is the only `"vout":0}]`).
+  assert.throws(
+    () => TransparentWallet.load(seed, CROSS_SDK_STATE.replace('"vout":0}]', '"vout":4294967296}]')),
+    /malformed pending entry/,
+  );
+  // The exact u32 max (0xffffffff) is still accepted — it's a cap, not a ban.
+  assert.doesNotThrow(() =>
+    TransparentWallet.load(seed, CROSS_SDK_STATE.replace('"vout":0,"amount":123456789', '"vout":4294967295,"amount":123456789')),
+  );
+});
+
 test('a scan-observed spend clears the reservation with the utxo', () => {
   const seed = new Uint8Array(32).fill(3);
   const w = TransparentWallet.create(seed, 'mainnet', 0, 20);
@@ -556,4 +578,345 @@ test('load rejects a future / non-ascending / oversized scannedHashes window', (
 
   // An honest window still loads (regression guard).
   assert.doesNotThrow(() => TransparentWallet.load(seed, CROSS_SDK_STATE));
+});
+
+// C1: selecting past MAX_STANDARD_TX_SIZE (100000, PIVX validation.h) must
+// error with consolidation guidance instead of building a tx the network
+// will never relay.
+test('buildSend caps at the 100kB standard tx size instead of building a doomed tx', () => {
+  const seed = new Uint8Array(32).fill(30);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spk = scriptPubKeyForAddress(a0.address);
+  // 700 dust UTXOs: satisfying the send needs > 675 inputs (> 100kB).
+  for (let i = 0; i < 700; i++) {
+    assert.equal(w.addUtxo(i.toString(16).padStart(64, '0'), 0, 10_000, spk), true);
+  }
+  assert.throws(() => w.buildSend(a0.address, 6_000_000, 10), /100kB standard size.*consolidate/);
+});
+
+// C2: an absurd feePerByte must yield a labeled error, not a fee past exact-
+// integer range that silently corrupts every later comparison.
+test('buildSend errors on fee overflow instead of computing with unsafe integers', () => {
+  const seed = new Uint8Array(32).fill(31);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  w.addUtxo('cc'.repeat(32), 0, 200_000_000, scriptPubKeyForAddress(a0.address));
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, 2 ** 60), /overflows/);
+});
+
+// C3: coinstake detection requires vout[0] to be EMPTY (zero value AND empty
+// script, CTxOut::IsEmpty). A zero-value OP_RETURN vout[0] tx paying us must
+// NOT be maturity-gated; a true coinstake still is.
+test('zero-value OP_RETURN vout[0] is not mistaken for a coinstake', () => {
+  const seed = new Uint8Array(32).fill(32);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  // Zero-value OP_RETURN at vout[0] (script '6a', not empty), pays us at
+  // vout 1: an ordinary tx, spendable with one confirmation.
+  w.scanBlock({
+    height: 100,
+    tx: [{
+      txid: '55'.repeat(32),
+      vin: [{ txid: '44'.repeat(32), vout: 0 }],
+      vout: [
+        { n: 0, value: 0, scriptPubKey: { hex: '6a' } },
+        { n: 1, value: 2.0, scriptPubKey: { hex: spkHex } },
+      ],
+    }],
+  });
+  assert.equal(w.balance(), 200_000_000);
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 100));
+
+  // A true coinstake (empty vout[0]: value 0 AND script '') IS gated.
+  const w2 = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  w2.scanBlock({
+    height: 100,
+    tx: [{
+      txid: '66'.repeat(32),
+      vin: [{ txid: '44'.repeat(32), vout: 0 }],
+      vout: [
+        { n: 0, value: 0, scriptPubKey: { hex: '' } },
+        { n: 1, value: 2.0, scriptPubKey: { hex: spkHex } },
+      ],
+    }],
+  });
+  assert.equal(w2.balance(), 200_000_000);
+  assert.throws(() => w2.buildSend(a0.address, 100_000_000, 100), /insufficient/);
+});
+
+// C4: addUtxo must reject what load() rejects — otherwise a wallet can
+// save() a state it can never load() again.
+test('addUtxo rejects what load would reject, and the state still round-trips', () => {
+  const seed = new Uint8Array(32).fill(33);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spk = scriptPubKeyForAddress(a0.address);
+  assert.equal(w.addUtxo('aa'.repeat(31), 0, 1000, spk), false);       // txid not 64-hex
+  assert.equal(w.addUtxo('zz'.repeat(32), 0, 1000, spk), false);       // txid not hex
+  assert.equal(w.addUtxo('aa'.repeat(32), 1.5, 1000, spk), false);     // fractional vout
+  assert.equal(w.addUtxo('aa'.repeat(32), 2 ** 32, 1000, spk), false); // vout past u32
+  assert.equal(w.addUtxo('aa'.repeat(32), 0, -1000, spk), false);      // negative amount
+  assert.equal(w.addUtxo('aa'.repeat(32), 0, 1000.5, spk), false);     // fractional amount
+  assert.equal(w.addUtxo('aa'.repeat(32), 0, 2 ** 53, spk), false);    // unsafe-integer amount
+  assert.equal(w.getUtxos().length, 0);
+  // A valid UTXO is still accepted and the state round-trips.
+  assert.equal(w.addUtxo('aa'.repeat(32), 0, 1000, spk), true);
+  assert.doesNotThrow(() => TransparentWallet.load(seed, w.save()));
+});
+
+// C5: re-scanning an already-scanned block must not push a duplicate window
+// entry that load() then rejects (save/load self-brick).
+test('scanning the same block twice still saves and loads', () => {
+  const seed = new Uint8Array(32).fill(34);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const block = { height: 100, hash: 'aa'.repeat(32), tx: [] };
+  w.scanBlock(block);
+  w.scanBlock(block); // e.g. a replay after a crash-restore
+  assert.equal(w.lastScannedBlock(), 100);
+  const json = w.save();
+  let restored;
+  assert.doesNotThrow(() => { restored = TransparentWallet.load(seed, json); }, 'state after a re-scan must load');
+  assert.equal(restored.save(), json);
+});
+
+// C6: a buildSend reservation must survive resetScan — after the re-scan
+// re-credits the outpoint, a second send must not double-select the inputs
+// of the still-in-flight first send.
+test('a buildSend reservation survives resetScan', () => {
+  const seed = new Uint8Array(32).fill(35);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  const block = {
+    height: 100,
+    hash: 'aa'.repeat(32),
+    tx: [{
+      txid: 'e1'.repeat(32),
+      vin: [{ txid: 'f1'.repeat(32), vout: 0 }],
+      vout: [{ n: 0, value: 2.0, scriptPubKey: { hex: spkHex } }],
+    }],
+  };
+  w.scanBlock(block);
+  const { spent } = w.buildSend(a0.address, 100_000_000, 100); // reserves e1:0
+  w.resetScan(99); // reorg walk-back: drops the UTXO, keeps the reservation
+  w.scanBlock(block); // re-scan re-credits e1:0
+  // Still reserved: the only UTXO must not be selectable again.
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, 100), /insufficient/);
+  // release (or a scan-observed spend / markSpent) frees it.
+  w.release(spent);
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 100));
+});
+
+// C7: feerates below the node's relay floor (minRelayTxFee = 10000/kB =
+// 10 sat/byte, PIVX validation.cpp) are rejected with the minimum named.
+test('buildSend rejects a feePerByte below the 10 sat/byte relay floor', () => {
+  const seed = new Uint8Array(32).fill(36);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  w.addUtxo('cc'.repeat(32), 0, 200_000_000, scriptPubKeyForAddress(a0.address));
+  assert.throws(() => w.buildSend(a0.address, 100_000_000, 9), /minRelayTxFee/);
+  assert.doesNotThrow(() => w.buildSend(a0.address, 100_000_000, 10));
+});
+
+// C8: resetScan can only rewind — a height above lastScanned would silently
+// skip the blocks in between.
+test('resetScan rejects a height above the last scanned block', () => {
+  const seed = new Uint8Array(32).fill(37);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  w.scanBlock({ height: 100, hash: 'aa'.repeat(32), tx: [] });
+  assert.throws(() => w.resetScan(150), /above the last scanned/);
+  assert.equal(w.lastScannedBlock(), 100); // nothing mutated
+  assert.doesNotThrow(() => w.resetScan(100)); // rewind-to-current is fine
+});
+
+// C9: hostile vout entries are SKIPPED, never mangled — non-integer indices
+// and negative values must not be credited or brick a later load.
+test('scanBlock skips non-integer vout indices and negative values (and still round-trips)', () => {
+  const seed = new Uint8Array(32).fill(38);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  w.scanBlock({
+    height: 10,
+    tx: [{
+      txid: 'ee'.repeat(32),
+      vin: [{ txid: 'ff'.repeat(32), vout: 0 }],
+      vout: [
+        { n: 1.5, value: 1.0, scriptPubKey: { hex: spkHex } }, // fractional index
+        { n: 0, value: -3.0, scriptPubKey: { hex: spkHex } },  // negative value
+        { n: 2 ** 32, value: 1.0, scriptPubKey: { hex: spkHex } }, // index past u32
+        { n: 2, value: 1.0, scriptPubKey: { hex: spkHex } },   // valid
+      ],
+    }],
+  });
+  assert.equal(w.getUtxos().length, 1); // only the valid vout credited
+  assert.equal(w.balance(), 100_000_000);
+  assert.doesNotThrow(() => TransparentWallet.load(seed, w.save()));
+});
+
+// C10: getUtxos must hand out copies — mutating a returned utxo (or its
+// scriptPubKey bytes) must not corrupt wallet state.
+test('getUtxos returns copies, not live internals', () => {
+  const seed = new Uint8Array(32).fill(40);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  w.addUtxo('aa'.repeat(32), 0, 200_000_000, scriptPubKeyForAddress(a0.address));
+  const [u] = w.getUtxos();
+  u.amount = 1;
+  u.scriptPubKey.fill(0xff);
+  assert.equal(w.balance(), 200_000_000); // untouched
+  const { hex } = w.buildSend(a0.address, 100_000_000, 100); // script not corrupted
+  assert.match(hex, /^01000000/);
+});
+
+// C12: spendableBalance applies buildSend's maturity filter; balance
+// deliberately does not.
+test('spendableBalance excludes immature coinbase that balance counts', () => {
+  const seed = new Uint8Array(32).fill(39);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  w.scanBlock({
+    height: 100,
+    tx: [{ txid: 'dd'.repeat(32), vin: [{ coinbase: '00' }], vout: [{ n: 0, value: 5.0, scriptPubKey: { hex: spkHex } }] }],
+  });
+  assert.equal(w.balance(), 500_000_000);    // counted...
+  assert.equal(w.spendableBalance(), 0);     // ...but not yet spendable
+  w.scanBlock({ height: 199, tx: [] });      // 100 confirmations: mature
+  assert.equal(w.spendableBalance(), 500_000_000);
+});
+
+// W1: buildSend's loop-time size guard works on an ESTIMATE; a drifted
+// estimator could still let an oversized tx through, and PIVX rejects any tx
+// at or above MAX_STANDARD_TX_SIZE (sz >= 100000, src/policy/policy.cpp).
+// The builder re-checks the ACTUAL serialized size — and buildSend reserves
+// inputs only after the builder returns, so nothing is reserved for a doomed
+// tx. 700 P2PKH inputs serialize past 100kB for ANY signature sizes (even
+// minimal 145-byte inputs give ~101.5kB).
+test('buildTransparentTx refuses a tx whose ACTUAL size reaches 100kB', () => {
+  const seed = new Uint8Array(32).fill(33);
+  const k = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spk = scriptPubKeyForAddress(k.address);
+  const inputs = Array.from({ length: 700 }, (_, i) => ({
+    txid: i.toString(16).padStart(64, '0'),
+    vout: 0,
+    amount: 150_000,
+    scriptPubKey: spk,
+    privateKey: k.privateKey,
+  }));
+  assert.throws(
+    () => buildTransparentTx(inputs, [{ address: k.address, amount: 1_000_000 }], 0),
+    /100kB standard size/,
+  );
+});
+
+// W2: an invalid block height (NaN/negative/fractional/2^53/string/missing)
+// must be a labeled error with state untouched — before the fix it poisoned
+// lastScanned and bricked the next load() (JSON NaN serializes to null;
+// negative/fractional/unsafe heights fail load's counter checks). Both SDKs
+// bound heights to [0, 2^53-1] so a state loads in both or neither.
+test('scanBlock rejects invalid heights before mutating state', () => {
+  const seed = new Uint8Array(32).fill(34);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  w.scanBlock({
+    height: 100,
+    hash: 'aa'.repeat(32),
+    tx: [{ txid: 'bb'.repeat(32), vin: [{ coinbase: '00' }], vout: [{ n: 0, value: 1.0, scriptPubKey: { hex: spkHex } }] }],
+  });
+  assert.equal(w.balance(), 100_000_000);
+  const payTx = [{ txid: 'cc'.repeat(32), vin: [{ txid: 'dd'.repeat(32), vout: 0 }], vout: [{ n: 0, value: 2.0, scriptPubKey: { hex: spkHex } }] }];
+  for (const height of [NaN, -1, 1.5, 2 ** 53, '101', undefined]) {
+    assert.throws(
+      () => w.scanBlock({ height, hash: 'ee'.repeat(32), tx: payTx }),
+      /height/,
+      `height ${String(height)}`,
+    );
+  }
+  assert.equal(w.lastScannedBlock(), 100, 'scan position untouched');
+  assert.equal(w.balance(), 100_000_000, 'nothing credited from rejected blocks');
+  // The state still saves and loads (a poisoned height used to brick load()).
+  const r = TransparentWallet.load(seed, w.save());
+  assert.equal(r.lastScannedBlock(), 100);
+});
+
+// W2: resetScan(-1) used to drop every scanned UTXO and set a negative scan
+// position that bricked the next load(); now it rejects before mutating.
+test('resetScan rejects negative and non-integer heights before mutating', () => {
+  const seed = new Uint8Array(32).fill(35);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const spkHex = toHex(scriptPubKeyForAddress(a0.address));
+  w.scanBlock({
+    height: 100,
+    hash: 'aa'.repeat(32),
+    tx: [{ txid: 'bb'.repeat(32), vin: [{ txid: 'dd'.repeat(32), vout: 0 }], vout: [{ n: 0, value: 1.0, scriptPubKey: { hex: spkHex } }] }],
+  });
+  assert.equal(w.balance(), 100_000_000);
+  for (const height of [-1, 1.5, NaN]) {
+    assert.throws(() => w.resetScan(height), /height/, `height ${String(height)}`);
+  }
+  assert.equal(w.lastScannedBlock(), 100, 'scan position untouched');
+  assert.equal(w.balance(), 100_000_000, 'scanned UTXOs kept');
+  TransparentWallet.load(seed, w.save()); // state still loads
+});
+
+// W1: create rejects an account in the hardened range (which would alias a
+// lower account and emit a state load() rejects).
+test('W1: create rejects a hardened-range account', () => {
+  assert.throws(() => TransparentWallet.create(new Uint8Array(32).fill(1), 'mainnet', 2 ** 31, 2), /account/);
+  assert.doesNotThrow(() => TransparentWallet.create(new Uint8Array(32).fill(1), 'mainnet', 2 ** 31 - 1, 2));
+});
+
+// W-SEED: accept a 32-byte raw seed OR a 64-byte BIP39 seed; reject any other length.
+test('W-SEED: create accepts a 32- or 64-byte seed, rejects others', () => {
+  assert.doesNotThrow(() => TransparentWallet.create(new Uint8Array(32).fill(1), 'mainnet', 0, 2));
+  assert.doesNotThrow(() => TransparentWallet.create(new Uint8Array(64).fill(1), 'mainnet', 0, 2));
+  assert.throws(() => TransparentWallet.create(new Uint8Array(16).fill(1), 'mainnet', 0, 2), /seed must be/);
+  assert.throws(() => TransparentWallet.create(new Uint8Array(33).fill(1), 'mainnet', 0, 2), /seed must be/);
+});
+
+// W2: load bounds persisted heights to [0, 2^53-1] (verify — JS was already
+// bounded via isCount; the shield side gained the matching bound).
+test('W2: load rejects out-of-range persisted heights', () => {
+  const seed = new Uint8Array(32).fill(1);
+  assert.doesNotThrow(() => TransparentWallet.load(seed, CROSS_SDK_STATE));
+  assert.throws(
+    () => TransparentWallet.load(seed, CROSS_SDK_STATE.replace('"lastScanned":7', '"lastScanned":9007199254740993')),
+    /counter/i,
+  );
+  assert.throws(
+    () => TransparentWallet.load(seed, CROSS_SDK_STATE.replace('"coinbase":true,"height":7', '"coinbase":true,"height":9007199254740993')),
+    /malformed utxo/,
+  );
+});
+
+// W4: an EXM output is 35 bytes (26-byte script), not the 34 a flat P2PKH
+// assumes. At 10 sat/byte an EXM send must pay 10 sats more fee (10 sats less
+// change) than a P2PKH send — before the fix both were counted at 34.
+test('W4: EXM recipient is fee-sized at its true length; P2PKH unchanged', () => {
+  // Change output is the last output: [8-byte value][0x19][25-byte script][4 locktime].
+  const readChangeValue = (hex) => {
+    const valHex = hex.slice(hex.length - 76, hex.length - 60);
+    let v = 0n;
+    for (let i = 0; i < 8; i++) v += BigInt(parseInt(valHex.slice(i * 2, i * 2 + 2), 16)) << BigInt(8 * i);
+    return Number(v);
+  };
+  const changeAfter = (toExm) => {
+    const seed = new Uint8Array(32).fill(5);
+    const w = TransparentWallet.create(seed, 'mainnet', 0, 5);
+    const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+    assert.equal(w.addUtxo('aa'.repeat(32), 0, 1_000_000_000, scriptPubKeyForAddress(a0.address)), true);
+    const hash = hash160(deriveKey(new Uint8Array(32).fill(9), 'mainnet', 0, 0, 0).publicKey);
+    const to = encodeAddress(hash, 'mainnet', toExm ? 'exchange' : 'p2pkh');
+    const { hex } = w.buildSend(to, 100_000_000, 10);
+    assert.equal(hex.slice(hex.length - 60, hex.length - 58), '19', 'change is a 25-byte P2PKH output');
+    return readChangeValue(hex);
+  };
+  const changeExm = changeAfter(true);
+  const changeP2pkh = changeAfter(false);
+  assert.equal(changeP2pkh - changeExm, 10);
 });

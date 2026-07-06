@@ -4,7 +4,8 @@ import type { ShieldNote } from './types.js';
 export interface ShieldWatcherOptions {
   /** Poll interval in ms. PIVX targets 60s blocks; default 15000. */
   pollIntervalMs?: number;
-  /** Only consider notes with at least this many confirmations. Default 1. */
+  /** Only consider notes with at least this many confirmations. Default 1.
+   * 0 includes unconfirmed (mempool) notes — the node accepts it. */
   minConf?: number;
   /** Restrict watching to these shield addresses. Default: all wallet addresses. */
   addresses?: string[];
@@ -77,6 +78,11 @@ const noteKey = (n: ShieldNote) => `${n.txid}:${n.outindex}`;
  * Polls the node and emits events when shielded notes appear, are spent,
  * or the total shield balance changes.
  *
+ * Delivery is at most once: state is committed before any events are
+ * emitted, so a throwing listener drops that poll's remaining events (they
+ * are never re-emitted on the next poll — the error surfaces via the
+ * 'error' event instead).
+ *
  * Watch-only caveat (from the node itself): with only incoming viewing keys
  * imported, spends cannot be detected, so `spent` events and balance
  * decreases only fire for addresses whose spending key is in the wallet.
@@ -91,6 +97,10 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
   private timer?: ReturnType<typeof setInterval>;
   private polling = false;
   private primed = false;
+  /** Set by stop(): an in-flight poll may still commit state, but must not
+   * emit after stop(). Distinct from `timer` so manual poll() callers that
+   * never start() still get events. */
+  private stopped = false;
 
   constructor(
     private readonly client: PivxClient,
@@ -102,6 +112,7 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
   /** Begin polling. The first poll primes state without emitting note events. */
   start(): this {
     if (this.timer) return this;
+    this.stopped = false;
     const interval = this.opts.pollIntervalMs ?? 15000;
     this.timer = setInterval(() => void this.poll(), interval);
     this.timer.unref?.();
@@ -112,6 +123,7 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    this.stopped = true;
   }
 
   /** One polling pass. Exposed for callers that want their own scheduling. */
@@ -129,33 +141,45 @@ export class ShieldWatcher extends Emitter<ShieldWatcherEvents> {
         this.opts.addresses,
       );
 
+      // Compute the diffs first, COMMIT all state, then emit: a throwing
+      // listener lands in the catch below, and committed state guarantees the
+      // next poll does not re-emit the same events.
       const current = new Map(notes.map((n) => [noteKey(n), n]));
+      const arrived: ShieldNote[] = [];
+      const spent: ShieldNote[] = [];
       if (this.primed) {
         for (const [key, note] of current) {
-          if (!this.notes.has(key)) this.emit('note', note);
+          if (!this.notes.has(key)) arrived.push(note);
         }
         for (const [key, note] of this.notes) {
-          if (!current.has(key)) this.emit('spent', note);
+          if (!current.has(key)) spent.push(note);
         }
       }
-      this.notes = current;
 
       const balance = notes.reduce((sum, n) => sum + n.amount, 0);
       // Detect change on the true satoshi sum; the event payload stays PIV.
       const balanceSats = notes.reduce((sum, n) => sum + Math.round(n.amount * 1e8), 0);
-      if (this.primed && balanceSats !== this.lastBalanceSats) {
-        this.emit('balance', balance, this.lastBalance);
-      }
+      const balanceChanged = this.primed && balanceSats !== this.lastBalanceSats;
+      const previousBalance = this.lastBalance;
+
+      this.notes = current;
       this.lastBalance = balance;
       this.lastBalanceSats = balanceSats;
       this.lastHash = hash;
       this.primed = true;
+
+      // stop() during the in-flight RPC: state is committed above, but
+      // nothing may be delivered after stop().
+      if (this.stopped) return;
+      for (const note of arrived) this.emit('note', note);
+      for (const note of spent) this.emit('spent', note);
+      if (balanceChanged) this.emit('balance', balance, previousBalance);
       this.emit('block', hash);
     } catch (err) {
       // A poller must not crash the process on a transient RPC blip, so only
       // emit when someone is listening; otherwise swallow (the next poll
-      // retries).
-      if (this.listenerCount('error') > 0) {
+      // retries). Never emit after stop().
+      if (!this.stopped && this.listenerCount('error') > 0) {
         this.emit('error', err instanceof Error ? err : new Error(String(err)));
       }
     } finally {

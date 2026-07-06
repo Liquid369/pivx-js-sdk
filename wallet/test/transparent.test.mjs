@@ -15,6 +15,47 @@ test('BIP44 derivation matches the Rust SDK and is deterministic', () => {
   assert.ok(k.wif.length > 0 && k.privateKey.length === 32 && k.publicKey.length === 33);
 });
 
+// W-SEED reference lock (funds-critical): a 64-byte BIP39 seed derives the same
+// m/44'/119'/0'/0/0 address MyPIVXWallet (MPW) / BIP39 seed-phrase wallets produce
+// (BIP32 over the FULL seed). This is the correctness gate for accepting the BIP39 seed.
+test('W-SEED: 64-byte BIP39 seed derives the reference PIVX address', () => {
+  // BIP39 seed (empty passphrase) of the standard test mnemonic
+  // "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".
+  const seed = Uint8Array.from(
+    ('5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1' +
+      '9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4')
+      .match(/../g)
+      .map((b) => parseInt(b, 16)),
+  );
+  assert.equal(seed.length, 64);
+  assert.equal(deriveKey(seed, 'mainnet', 0, 0, 0).address, 'DPo9TNvPwy2ZfmVM3CRCxbBvh6NojguWXJ');
+});
+
+// W-SEEDLEN: the exported deriveKey enforces the 32/64-byte seed contract at its
+// top (the transparent constructors route through it), so an out-of-contract
+// length can no longer bypass the check by calling deriveKey directly.
+test('deriveKey rejects seeds that are not 32 or 64 bytes', () => {
+  for (const n of [16, 33, 48]) {
+    assert.throws(
+      () => deriveKey(new Uint8Array(n).fill(1), 'mainnet', 0, 0, 0),
+      /seed must be 32 bytes \(raw\) or 64 bytes \(BIP39\)/,
+    );
+  }
+  assert.doesNotThrow(() => deriveKey(new Uint8Array(32).fill(1), 'mainnet', 0, 0, 0));
+  assert.doesNotThrow(() => deriveKey(new Uint8Array(64).fill(1), 'mainnet', 0, 0, 0));
+});
+
+// W1: reject out-of-range account (hardened) / change / index rather than
+// deriving a silently-wrong key.
+test('W1: deriveKey rejects out-of-range account/change/index', () => {
+  const seed = new Uint8Array(32).fill(9);
+  assert.throws(() => deriveKey(seed, 'mainnet', 2 ** 31, 0, 0), /account/);
+  assert.doesNotThrow(() => deriveKey(seed, 'mainnet', 2 ** 31 - 1, 0, 0));
+  assert.throws(() => deriveKey(seed, 'mainnet', 1.5, 0, 0), /account/);
+  assert.throws(() => deriveKey(seed, 'mainnet', 0, 1.5, 0), /change/);
+  assert.throws(() => deriveKey(seed, 'mainnet', 0, 0, 2 ** 40), /index/);
+});
+
 test('address encode/decode round-trips for every kind and network', () => {
   const h = new Uint8Array(20).fill(0x11);
   for (const network of ['mainnet', 'testnet']) {

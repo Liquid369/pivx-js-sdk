@@ -97,6 +97,26 @@ export function deriveKey(
   change: number,
   index: number,
 ): TransparentKey {
+  // Root-cause seed-length gate: the transparent constructors route through
+  // here, so validating the 32/64-byte contract at the top of deriveKey covers
+  // every caller (BIP32 uses the FULL seed). Same text as the constructors.
+  if (seed.length !== 32 && seed.length !== 64) {
+    throw new Error('seed must be 32 bytes (raw) or 64 bytes (BIP39)');
+  }
+  // Range-check before derivation: `account` is hardened, so a value >= 2^31
+  // would (in the Rust twin's `account | HARDENED`) alias a lower account and
+  // emit a state load() rejects; change/index are non-hardened u32. Reject
+  // out-of-range or non-integer values with a labeled error rather than
+  // deriving a silently-wrong key.
+  if (!Number.isInteger(account) || account < 0 || account >= 0x8000_0000) {
+    throw new Error(`account must be an integer in [0, 2^31-1] (BIP32 hardened range), got ${account}`);
+  }
+  if (!Number.isInteger(change) || change < 0 || change > 0xffff_ffff) {
+    throw new Error(`change must be an integer in [0, 2^32-1], got ${change}`);
+  }
+  if (!Number.isInteger(index) || index < 0 || index > 0xffff_ffff) {
+    throw new Error(`index must be an integer in [0, 2^32-1], got ${index}`);
+  }
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/${COIN_TYPE[network]}'/${account}'/${change}/${index}`);
   if (!child.privateKey || !child.publicKey) throw new Error('key derivation failed');

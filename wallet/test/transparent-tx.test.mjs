@@ -33,6 +33,32 @@ test('build produces a legacy v1 tx with the expected structure', () => {
   assert.ok(hex.length / 2 > 150);
 });
 
+// nSequence of a single-input tx, parsed from the raw hex: 4 bytes
+// version+type, 1 varint vin count, 32 txid, 4 vout, 1 varint scriptSig
+// length, scriptSig, then the 4 sequence bytes.
+const firstInputSequence = (hex) => {
+  const scriptLen = parseInt(hex.slice(82, 84), 16);
+  return hex.slice(84 + scriptLen * 2, 84 + scriptLen * 2 + 8);
+};
+
+// C11: a non-zero locktime needs a non-final nSequence (0xfffffffe) or the
+// node ignores nLockTime entirely (IsFinalTx).
+test('locktime != 0 sets the non-final nSequence 0xfffffffe', () => {
+  const k = key(2);
+  const dest = key(3);
+  const build = (locktime) => buildTransparentTx(
+    [{ txid: 'ab'.repeat(32), vout: 0, amount: 100_000_000, scriptPubKey: scriptPubKeyForAddress(k.address), privateKey: k.privateKey }],
+    [{ address: dest.address, amount: 99_000_000 }],
+    locktime,
+  );
+  const withLock = build(500_000);
+  assert.match(withLock, /20a10700$/); // nLockTime = 500000 LE
+  assert.equal(firstInputSequence(withLock), 'feffffff'); // non-final
+  const without = build(0);
+  assert.match(without, /00000000$/);
+  assert.equal(firstInputSequence(without), 'ffffffff'); // final
+});
+
 test('build validates amounts and inputs', () => {
   const k = key(2);
   const input = { txid: 'ab'.repeat(32), vout: 0, amount: 100_000_000, scriptPubKey: scriptPubKeyForAddress(k.address), privateKey: k.privateKey };

@@ -5,6 +5,12 @@
  *
  * PIVX has no address index, so UTXOs are discovered either by scanning blocks
  * ({@link scan}) or supplied by the caller ({@link addUtxo}).
+ *
+ * Output recognition is deliberately narrow: only standard P2PKH outputs (and
+ * the OP_EXCHANGEADDR-prefixed EXM encoding, which pays the same key) are
+ * credited. P2PK outputs and cold-staking (P2CS) delegations paying our keys
+ * are NOT detected — this wallet's transaction builder can only spend
+ * P2PKH/EXM inputs, so crediting them would create unspendable balance.
  */
 import type { PivxClient } from 'pivx-rpc';
 import { decodeAddress, deriveKey, encodeAddress, hash160, type Network } from './transparent.js';
@@ -14,6 +20,7 @@ import { ScanDivergedError } from './wallet.js';
 const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
 const fromHex = (s: string): Uint8Array => Uint8Array.from((s.match(/../g) ?? []).map((b) => parseInt(b, 16)));
 const isHex = (s: string): boolean => /^(?:[0-9a-fA-F]{2})+$/.test(s);
+const isTxid = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v);
 
 /**
  * PIVX dust threshold (sats) for an output whose scriptPubKey is `scriptLen`
@@ -106,6 +113,12 @@ export class TransparentWallet {
    * `account`. Only outputs to these addresses are recognized.
    */
   static create(seed: Uint8Array, network: Network, account = 0, gap = 100): TransparentWallet {
+    // Accept a 32-byte raw seed OR a 64-byte BIP39 seed (MyPIVXWallet / BIP39
+    // seed-phrase wallets). BIP32 transparent derivation uses the FULL seed, so
+    // a 64-byte BIP39 seed reproduces MyPIVXWallet (MPW) / BIP39 seed-phrase wallet addresses.
+    if (seed.length !== 32 && seed.length !== 64) {
+      throw new Error('seed must be 32 bytes (raw) or 64 bytes (BIP39)');
+    }
     const w = new TransparentWallet(network);
     w.account = account;
     w.gap = gap;
@@ -155,6 +168,11 @@ export class TransparentWallet {
    * Add a caller-supplied UTXO if it pays one of our addresses. Returns true if
    * ours. Assumed a normal (non-coinbase) spendable output; use {@link scanBlock}
    * for chain data where coinbase maturity is tracked.
+   *
+   * Returns false (not ours / not accepted) for values {@link save}'s state
+   * format cannot round-trip: a non-64-hex txid, a non-integer or out-of-u32
+   * vout, or a negative or unsafe-integer amount. Accepting them would brick
+   * a later {@link load}.
    */
   addUtxo(txid: string, vout: number, amount: number, scriptPubKey: Uint8Array): boolean {
     return this.insertUtxo(txid, vout, amount, scriptPubKey, false, 0);
@@ -168,6 +186,13 @@ export class TransparentWallet {
     coinbase: boolean,
     height: number,
   ): boolean {
+    // Apply load()'s validation predicates at insertion: anything the state
+    // format cannot round-trip is rejected here instead of bricking a later
+    // load(). vout is additionally capped at u32 so the saved state also
+    // loads in the Rust SDK.
+    if (!isTxid(txid)) return false;
+    if (!Number.isInteger(vout) || vout < 0 || vout > 0xffffffff) return false;
+    if (!Number.isSafeInteger(amount) || amount < 0) return false;
     const h = ownedScriptHash(scriptPubKey);
     if (h && this.keys.has(h)) {
       this.utxos.set(`${txid}:${vout}`, { txid, vout, amount, scriptPubKey, keyHash: h, coinbase, height });
@@ -198,9 +223,19 @@ export class TransparentWallet {
    * block claims to extend the last scanned block (height + 1) but its
    * `previousblockhash` does not match the last scanned hash: the chain
    * reorganized under us. Recover with {@link resetScan} below the fork point
-   * and re-sync.
+   * and re-sync. Also throws (state untouched) when `block.height` is not an
+   * integer in [0, 2^53-1] — the bound both SDKs' state formats round-trip.
    */
   scanBlock(block: any): void {
+    // A NaN/negative/fractional/oversized height would poison lastScanned and
+    // brick the next load() (JSON NaN serializes to null; the counters fail
+    // load's checks). Both SDKs bound heights to [0, 2^53-1] so a saved state
+    // loads in both or neither. Reject before mutating anything.
+    if (!Number.isSafeInteger(block?.height) || block.height < 0) {
+      throw new Error(
+        `scanBlock: block height must be an integer in [0, 2^53-1], got ${block?.height}`,
+      );
+    }
     if (
       this.lastScannedHash !== null &&
       block.height === this.lastScanned + 1 &&
@@ -209,22 +244,26 @@ export class TransparentWallet {
     ) {
       throw new ScanDivergedError(block.height, this.lastScannedHash, block.previousblockhash);
     }
-    if (typeof block.height === 'number') this.lastScanned = block.height;
+    this.lastScanned = block.height;
     const height = this.lastScanned;
     for (const tx of block.tx ?? []) {
       if (typeof tx.txid !== 'string') continue;
       // Coinbase: first vin carries `coinbase` and no prevout. Coinstake (PoS):
-      // a spending vin plus an empty vout[0] (zero value). Both are maturity-
-      // gated for spending (src/txmempool.cpp).
+      // a spending vin plus an EMPTY vout[0] — zero value AND empty script,
+      // per CTxOut::IsEmpty (src/primitives/transaction.h). Checking value
+      // alone would maturity-gate e.g. a zero-value OP_RETURN tx paying us.
+      // Both are maturity-gated for spending (src/txmempool.cpp).
       const firstVin = tx.vin?.[0];
       const isCoinbase = firstVin?.coinbase !== undefined;
-      const isCoinstake = firstVin?.txid !== undefined && tx.vout?.[0]?.value === 0;
+      const isCoinstake =
+        firstVin?.txid !== undefined && tx.vout?.[0]?.value === 0 && tx.vout?.[0]?.scriptPubKey?.hex === '';
       const coinbase = isCoinbase || isCoinstake;
       for (const o of tx.vout ?? []) {
         const hexStr = o?.scriptPubKey?.hex;
         // Skip malformed vouts rather than poisoning balance with NaN or
-        // throwing mid-sync (matches the Rust scanner).
-        if (typeof o?.n !== 'number' || typeof o?.value !== 'number' || typeof hexStr !== 'string') continue;
+        // throwing mid-sync: n must be an integer and value non-negative
+        // (same skip semantics as the Rust scanner).
+        if (!Number.isInteger(o?.n) || typeof o?.value !== 'number' || o.value < 0 || typeof hexStr !== 'string') continue;
         const script = Uint8Array.from((hexStr.match(/../g) ?? []).map((b: string) => parseInt(b, 16)));
         this.insertUtxo(tx.txid, o.n, Math.round(o.value * 1e8), script, coinbase, height);
       }
@@ -234,8 +273,14 @@ export class TransparentWallet {
     }
     this.lastScannedHash = typeof block.hash === 'string' ? block.hash : null;
     // Record this block into the rolling reorg window (same usable-hash guard as
-    // lastScannedHash), keeping only the last REORG_WINDOW entries.
+    // lastScannedHash), keeping only the last REORG_WINDOW entries. Re-scanning
+    // an already-recorded height (e.g. replaying a block after a manual reset)
+    // first drops stale entries at/above it — mirroring resetScan's trim — so
+    // the window stays strictly ascending, which load() requires.
     if (typeof block.hash === 'string') {
+      while (this.scannedHashes.length > 0 && this.scannedHashes[this.scannedHashes.length - 1].height >= height) {
+        this.scannedHashes.pop();
+      }
       this.scannedHashes.push({ height, hash: block.hash });
       if (this.scannedHashes.length > REORG_WINDOW) {
         this.scannedHashes.splice(0, this.scannedHashes.length - REORG_WINDOW);
@@ -251,14 +296,28 @@ export class TransparentWallet {
   /**
    * Recovery path after {@link ScanDivergedError}: reset the scan position to
    * `height` (choose one below the fork point) and re-sync. Every scanned UTXO
-   * above that height is dropped, along with its reservation; caller-supplied
-   * UTXOs (tracked at height 0) are kept.
+   * above that height is dropped; caller-supplied UTXOs (tracked at height 0)
+   * are kept. Reservations made by {@link buildSend} are PRESERVED: the
+   * re-scan may re-credit the same outpoints, and releasing them here would
+   * let a second send double-select inputs of a still-in-flight transaction.
+   * A reservation to an outpoint that never comes back is inert; a scan that
+   * observes the spend clears it, as do {@link markSpent} and {@link release}.
+   *
+   * Throws if `height` is above the last scanned block: resetScan can only
+   * rewind — "resetting" forward would silently skip the blocks in between.
    */
   resetScan(height: number): void {
+    // A negative or non-integer reset height would poison lastScanned (and
+    // drop UTXOs) before bricking the next load(). Reject before mutating.
+    if (!Number.isInteger(height) || height < 0) {
+      throw new Error(`resetScan height must be a non-negative integer, got ${height}`);
+    }
+    if (height > this.lastScanned) {
+      throw new Error(`resetScan height ${height} is above the last scanned block ${this.lastScanned}`);
+    }
     for (const [k, u] of this.utxos) {
       if (u.height > height && u.height > 0) {
         this.utxos.delete(k);
-        this.pending.delete(k);
       }
     }
     // Trim the reorg window to the retained span; if the reset height is itself a
@@ -366,9 +425,11 @@ export class TransparentWallet {
   }
 
   /**
-   * Total spendable transparent balance in satoshis. Outputs reserved by
+   * Total transparent balance in satoshis. Outputs reserved by
    * {@link buildSend} are excluded (like the shield wallet's pending-note
-   * exclusion); {@link getUtxos} still lists them.
+   * exclusion); {@link getUtxos} still lists them. Immature coinbase/
+   * coinstake outputs ARE counted here even though {@link buildSend} cannot
+   * spend them yet — use {@link spendableBalance} for what a send can use.
    */
   balance(): number {
     return [...this.utxos.values()].reduce(
@@ -377,13 +438,37 @@ export class TransparentWallet {
     );
   }
 
-  /** All tracked UTXOs, including ones reserved by {@link buildSend} (unlike {@link balance}). */
-  getUtxos(): readonly OwnedUtxo[] {
-    return [...this.utxos.values()];
+  /**
+   * Balance actually selectable by {@link buildSend} right now: like
+   * {@link balance} but also excluding immature coinbase/coinstake outputs
+   * (the same maturity filter buildSend applies).
+   */
+  spendableBalance(): number {
+    const maturity = coinbaseMaturity(this.network);
+    return [...this.utxos.values()]
+      .filter((u) => !this.pending.has(`${u.txid}:${u.vout}`))
+      .filter((u) => !(u.coinbase && this.lastScanned - u.height + 1 < maturity))
+      .reduce((s, u) => s + u.amount, 0);
   }
 
-  private static estSize(nIn: number, nOut: number): number {
-    return nIn * 148 + nOut * 34 + 10;
+  /**
+   * All tracked UTXOs, including ones reserved by {@link buildSend} (unlike
+   * {@link balance}). Returns copies: mutating them does not affect the wallet.
+   */
+  getUtxos(): readonly OwnedUtxo[] {
+    return [...this.utxos.values()].map((u) => ({ ...u, scriptPubKey: new Uint8Array(u.scriptPubKey) }));
+  }
+
+  /** Serialized size of one output: 8-byte value + scriptPubKey varint + script.
+   * An EXM output is a 26-byte script (35 bytes total), not the 34 a flat
+   * P2PKH assumes — undercounting it makes min-feerate exchange sends underpay. */
+  private static outputSize(scriptLen: number): number {
+    return 8 + (scriptLen < 0xfd ? 1 : 3) + scriptLen;
+  }
+
+  private static estSize(nIn: number, outBytes: number): number {
+    // +2: the input-count varint grows from 1 to 3 bytes at 253 inputs.
+    return nIn * 148 + outBytes + 10 + (nIn >= 253 ? 2 : 0);
   }
 
   /**
@@ -407,7 +492,11 @@ export class TransparentWallet {
     // complete, or a reservation leaks.)
     if (this.busy) throw new Error('wallet is busy: a sync is in progress');
     if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error('amount must be a positive integer (satoshis)');
-    if (!Number.isInteger(feePerByte) || feePerByte <= 0) throw new Error('feePerByte must be a positive integer (satoshis/byte)');
+    // Below 10 sat/byte the node will not relay the tx: minRelayTxFee is
+    // 10000 sat/kB (PIVX src/validation.cpp).
+    if (!Number.isInteger(feePerByte) || feePerByte < 10) {
+      throw new Error('feePerByte must be an integer of at least 10 sat/byte (node minRelayTxFee = 10000 sat/kB)');
+    }
     const dest = decodeAddress(to); // throws on an invalid address
     // A mainnet wallet must not send to a testnet-encoded address (or vice
     // versa): the hash would be spent to this network's equivalent — a silent
@@ -418,6 +507,11 @@ export class TransparentWallet {
     const toScript = scriptPubKeyForAddress(to);
     if (amount < dustThreshold(toScript.length)) throw new Error('amount is below the dust threshold');
     const feerate = feePerByte;
+    // Size outputs by their real scriptPubKey length: the recipient's actual
+    // script (P2PKH 25, EXM 26, P2SH 23) plus a P2PKH change output (25).
+    // Selection conservatively assumes change is emitted (2 outputs).
+    const outBytes =
+      TransparentWallet.outputSize(toScript.length) + TransparentWallet.outputSize(25);
     // Exclude reserved outpoints (awaiting markSpent/release) and immature
     // coinbase/coinstake outputs: the node rejects a spend of one before
     // nCoinbaseMaturity confirmations (depth vs. last scanned block).
@@ -431,9 +525,20 @@ export class TransparentWallet {
     for (const u of avail) {
       selected.push(u);
       total += u.amount;
-      if (total >= amount + feerate * TransparentWallet.estSize(selected.length, 2)) break;
+      // At/above MAX_STANDARD_TX_SIZE (100000, PIVX src/validation.h) the
+      // node will never relay or mine the tx — policy rejects at `sz >=
+      // 100000` (src/policy/policy.cpp) — so building it would only doom it.
+      if (TransparentWallet.estSize(selected.length, outBytes) >= 100_000) {
+        throw new Error(
+          'transaction would exceed the 100kB standard size (too many small inputs); consolidate UTXOs first',
+        );
+      }
+      if (total >= amount + feerate * TransparentWallet.estSize(selected.length, outBytes)) break;
     }
-    const fee = feerate * TransparentWallet.estSize(selected.length, 2);
+    const fee = feerate * TransparentWallet.estSize(selected.length, outBytes);
+    // An absurd feePerByte can push the fee past exact-integer range, making
+    // every later comparison unreliable (the Rust SDK errors on u64 overflow).
+    if (!Number.isSafeInteger(fee)) throw new Error('fee computation overflows: feePerByte is too large');
     if (total < amount + fee) throw new Error('insufficient transparent balance to cover amount + fee');
     const changeVal = total - amount - fee;
 
@@ -560,10 +665,9 @@ export class TransparentWallet {
     w.nextChange = s.nextChange;
     w.lastScanned = s.lastScanned;
     w.lastScannedHash = s.lastScannedHash;
-    const isTxid = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v);
     for (const u of s.utxos) {
       if (
-        !isTxid(u?.txid) || !isCount(u.vout) ||
+        !isTxid(u?.txid) || !isCount(u.vout) || u.vout > 0xffffffff ||
         !Number.isSafeInteger(u.amount) || u.amount < 0 ||
         typeof u.scriptPubKey !== 'string' || !isHex(u.scriptPubKey) ||
         typeof u.keyHash !== 'string' || typeof u.coinbase !== 'boolean' || !isCount(u.height)
@@ -591,7 +695,9 @@ export class TransparentWallet {
       });
     }
     for (const p of s.pending) {
-      if (!isTxid(p?.txid) || !isCount(p.vout)) {
+      // Cap vout at 0xffffffff to match the Rust SDK's u32 (a state loads in
+      // both or neither); isCount alone would accept up to 2^53-1.
+      if (!isTxid(p?.txid) || !isCount(p.vout) || p.vout > 0xffffffff) {
         throw new Error('wallet state contains a malformed pending entry');
       }
       w.pending.add(`${p.txid}:${p.vout}`);

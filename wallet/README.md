@@ -31,6 +31,8 @@ const txid = await wallet.send(client, { to: 'ps1…', amount: 150_000_000, memo
 ```
 
 A wallet is built from a seed, spending key, or viewing key — watch-only is a
-capability level, upgradeable in place.
+capability level, upgradeable in place. The seed is a 32-byte raw seed or a
+64-byte BIP39 seed; the 64-byte BIP39 seed reproduces MyPIVXWallet (MPW) /
+BIP39 seed-phrase wallet addresses.
 
 Full docs, security model, and examples: https://github.com/Liquid369/pivx-js-sdk

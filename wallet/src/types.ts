@@ -32,7 +32,12 @@ export interface TransparentInput {
 }
 
 export interface CreateWalletOptions {
-  /** 32 bytes of seed entropy (derives the spending key; full capability). */
+  /**
+   * Seed entropy (derives the spending key; full capability). Accepts a
+   * 32-byte raw seed OR a 64-byte BIP39 seed. The 64-byte BIP39 seed
+   * reproduces MyPIVXWallet (MPW) / BIP39 seed-phrase wallet addresses (shield uses its first 32
+   * bytes for ZIP32; a separate transparent wallet uses the full 64 bytes).
+   */
   seed?: Uint8Array;
   /** Bech32 extended spending key (`p-secret-spending-key-…`; full capability). */
   spendingKey?: string;
@@ -66,10 +71,16 @@ export interface CreateTransactionOptions {
   /** Required when spending transparent inputs (change must stay transparent). */
   transparentChangeAddress?: string;
   /**
-   * Opt in to sweep semantics: allow the amount to consume the entire
-   * spendable balance, paying the fee out of the recipient's amount.
-   * Without this, an amount that leaves no room for the fee is rejected.
+   * Pay the transaction fee out of the recipient's amount when the selected
+   * inputs cover the amount but not amount + fee, instead of failing — the
+   * same flag as the Rust SDK's `subtract_fee_from_amount`. Set it to send
+   * the entire spendable balance (amount = balance, fee comes out of it).
+   * Without it, an amount that leaves no room for the fee is rejected rather
+   * than silently underpaying the recipient.
    */
+  subtractFeeFromAmount?: boolean;
+  /** @deprecated use {@link subtractFeeFromAmount} — same flag, kept as an
+   * accepted alias for one release. */
   sweep?: boolean;
 }
 

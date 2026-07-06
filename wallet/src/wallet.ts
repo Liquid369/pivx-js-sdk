@@ -1,4 +1,5 @@
 import { RpcError, type PivxClient } from 'pivx-rpc';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { loadShield, type ProvingOptions, type Shield } from './shield-bindings.js';
 import type {
   BuiltTransaction,
@@ -13,6 +14,25 @@ import type {
 
 /** PIVX BIP44 coin types. */
 const COIN_TYPE = { mainnet: 119, testnet: 1 } as const;
+
+/** SHA256 of the sapling proving parameters, pinned identically to the Rust
+ * SDK's prover.rs (OUTPUT_SHA256 / SPEND_SHA256). loadProver verifies every
+ * source (bytes, path, and url-fetched bytes) against these before handing
+ * them to the WASM. */
+const OUTPUT_SHA256 = '2f0ebbcbb9bb0bcffe95a397e7eba89c29eb4dde6191c339db88570e3f3fb0e4';
+const SPEND_SHA256 = '8e48ffd23abb3a5fd9c5589204f32d9c31285a04b78096ba40a79b75677efc13';
+
+const toHex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+
+/** Reject sapling proving params whose SHA256 does not match the pinned hash. */
+function verifyProvingParams(output: Uint8Array, spend: Uint8Array): void {
+  if (toHex(sha256(output)) !== OUTPUT_SHA256) {
+    throw new Error('sapling output parameters failed SHA256 verification');
+  }
+  if (toHex(sha256(spend)) !== SPEND_SHA256) {
+    throw new Error('sapling spend parameters failed SHA256 verification');
+  }
+}
 
 /** Threshold at/above which the sapling root check runs; below it we skip. These
  * are the exact UPGRADE_V5_0 activation heights (inclusive) from PIVX consensus,
@@ -86,6 +106,29 @@ export class NoSpendAuthorityError extends Error {
   }
 }
 
+/** Thrown when the selected inputs can't cover the amount plus fee (and the
+ * caller did not opt into paying the fee out of the recipient's amount).
+ * Subclasses Error, so `catch (e) { if (e instanceof Error) … }` still works. */
+export class InsufficientFundsError extends Error {
+  constructor() {
+    super(
+      'insufficient input value to cover amount + fee; lower the amount, ' +
+        'add inputs, or pass subtractFeeFromAmount:true to deduct the fee from the recipient',
+    );
+    this.name = 'InsufficientFundsError';
+  }
+}
+
+/** Thrown when a state-mutating call (sync, spend, handleBlocks,
+ * reloadFromCheckpoint) races another one already in progress. Subclasses
+ * Error so existing `instanceof Error` catches keep working. */
+export class WalletBusyError extends Error {
+  constructor() {
+    super('wallet is busy: another sync or spend is in progress');
+    this.name = 'WalletBusyError';
+  }
+}
+
 /** Thrown when the local commitment tree diverges from the node's sapling root. */
 export class ScanDivergedError extends Error {
   constructor(
@@ -95,7 +138,7 @@ export class ScanDivergedError extends Error {
   ) {
     super(
       `scan diverged at height ${height}: wallet state is corrupt or the node is on another chain; ` +
-        'recreate the wallet from its keys (or resetScan for a transparent wallet) and resync',
+        'call reloadFromCheckpoint() (or resetScan for a transparent wallet) and resync',
     );
     this.name = 'ScanDivergedError';
   }
@@ -116,6 +159,23 @@ const assertSats = (v: unknown): number => {
 // little-endian version of 3, so the hex starts with "03". This assumes
 // version 3 is the only shielded version; revisit if that ever changes.
 const isSaplingTx = (hex: string): boolean => hex.startsWith('03');
+
+/** RPC errors that mean the node ALREADY HAS this transaction (or a
+ * conflicting one in its mempool), so the spend may still confirm: -27 =
+ * transaction already in chain (PIVX rpc/protocol.h), the reject reasons
+ * txn-already-in-mempool / txn-already-known / txn-mempool-conflict, and the
+ * shield-specific bad-txns-nullifier-double-spent (a mempool tx already
+ * spends a nullifier of ours — possibly this very tx, rebroadcast or raced)
+ * and bad-txns-shielded-requirements-not-met (HaveShieldedRequirements: an
+ * anchor/nullifier already spent on-chain) — all PIVX validation.cpp. The
+ * -27 already-in-chain probe scans vout only (rawtransaction.cpp), so it can
+ * never fire for a z→z spend; the shield-specific reasons are what fire
+ * instead. Treated like a transport error: keep the spend pending. */
+const txMayBeAccepted = (err: RpcError): boolean =>
+  err.code === -27 ||
+  /txn-already-in-mempool|txn-already-known|txn-mempool-conflict|bad-txns-nullifier-double-spent|bad-txns-shielded-requirements-not-met/.test(
+    err.message,
+  );
 
 /**
  * Standalone PIVX wallet: owns keys, scans blocks, tracks shielded notes,
@@ -173,7 +233,14 @@ export class PivxWallet {
 
     let extsk: string | undefined;
     if (opts.seed) {
-      if (opts.seed.length !== 32) throw new Error('seed must be 32 bytes');
+      // Accept a 32-byte raw seed OR a 64-byte BIP39 seed (MyPIVXWallet /
+      // BIP39 seed-phrase wallets). ZIP32 shield derivation uses only the
+      // first 32 bytes; the pivx-shield WASM truncates whatever it's given, so
+      // pass the seed through unchanged — a 64-byte seed and its first 32 bytes
+      // yield the same spending key.
+      if (opts.seed.length !== 32 && opts.seed.length !== 64) {
+        throw new Error('seed must be 32 bytes (raw) or 64 bytes (BIP39)');
+      }
       extsk = shield.generate_extended_spending_key_from_seed({
         seed: Array.from(opts.seed),
         coin_type: COIN_TYPE[network],
@@ -186,6 +253,13 @@ export class PivxWallet {
       ? (shield.generate_extended_full_viewing_key(extsk, isTestnet) as string)
       : opts.viewingKey!;
 
+    // The WASM converts birthHeight to i32, wrapping silently: 2^40 -> 0
+    // (rescan from genesis), 1e20 -> a near-tip skip past real deposits.
+    // Require a non-negative integer within i32 range so get_closest_checkpoint
+    // sees the height the caller meant (the Rust twin clamps at the same bound).
+    if (!Number.isSafeInteger(opts.birthHeight) || opts.birthHeight < 0 || opts.birthHeight > 0x7fff_ffff) {
+      throw new Error(`birthHeight must be an integer in [0, 2^31-1], got ${opts.birthHeight}`);
+    }
     // Resume from the checkpoint's own height, not birthHeight: the loaded
     // tree is the committed state AT the checkpoint, so scanning must start
     // at checkpointHeight + 1. Starting higher would leave the tree missing
@@ -293,7 +367,7 @@ export class PivxWallet {
    * {@link sync}.
    */
   handleBlocks(blocks: WalletBlock[]): string[] {
-    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    if (this.busy) throw new WalletBusyError();
     return this.applyBlocks(blocks);
   }
 
@@ -301,17 +375,42 @@ export class PivxWallet {
    * already holds the guard). */
   private applyBlocks(blocks: WalletBlock[]): string[] {
     let prev = this.lastProcessedBlock;
+    const activation = SAPLING_ACTIVATION[this.network];
     for (const b of blocks) {
+      // A NaN/undefined/fractional height would bypass the ascending guard
+      // below (NaN <= prev is false) and the below-activation filter, and
+      // poison lastProcessedBlock. Reject before any state is touched.
+      if (!Number.isSafeInteger(b.height)) {
+        throw new Error(`block height must be a safe integer, got ${b.height}`);
+      }
       if (b.height <= prev) {
         throw new Error(`blocks must be strictly ascending and above ${this.lastProcessedBlock}`);
       }
       prev = b.height;
+      for (const t of b.txs) {
+        // A tx object without hex is malformed block data: fail with the
+        // block named (matches the Rust SDK) rather than a bare TypeError.
+        if (typeof t.hex !== 'string') {
+          throw new Error(`block ${b.height} has a tx without hex`);
+        }
+      }
     }
     if (blocks.length === 0) return [];
 
+    // Below SAPLING_ACTIVATION, '03'-prefixed txs are SKIPPED rather than
+    // scanned: consensus forbids shielded DATA below activation (IsShieldedTx
+    // = sapling version AND sapling data, PIVX transaction.h /
+    // sapling_validation.cpp), not the version byte itself, so a bare-v3
+    // empty-sapdata tx is consensus-legal and must not fail the sync. Bare v3
+    // is excluded from real chains by serialization history and carries no
+    // shield data, so skipping loses nothing; fabricated sapling data below
+    // activation is unverifiable (the root check is skipped down there) and
+    // stays uncredited because it never reaches the scanner.
     const result = this.shield.handle_blocks(
       this.commitmentTree,
-      blocks.map((b) => ({ txs: b.txs.map((t) => t.hex).filter(isSaplingTx) })),
+      blocks.map((b) => ({
+        txs: b.height >= activation ? b.txs.map((t) => t.hex).filter(isSaplingTx) : [],
+      })),
       this.extfvk,
       this.isTestnet,
       this.notes,
@@ -386,7 +485,7 @@ export class PivxWallet {
    * SECURITY.md.
    */
   async sync(client: PivxClient, opts: SyncOptions = {}): Promise<void> {
-    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    if (this.busy) throw new WalletBusyError();
     this.busy = true;
     try {
       const throwIfAborted = () => {
@@ -414,6 +513,12 @@ export class PivxWallet {
         // fast-forward lastProcessedBlock past real deposits.
         if (block.height !== h) {
           throw new Error(`node returned block height ${block.height} for requested height ${h}`);
+        }
+        // A block without a tx array is malformed node data: dropping it would
+        // desync the commitment tree. Fail with the block named, matching the
+        // transparent side's hash/previousblockhash guards and the Rust twin.
+        if (!Array.isArray(block.tx)) {
+          throw new Error(`node returned a malformed block: missing tx array at height ${h}`);
         }
         return block;
       };
@@ -584,7 +689,14 @@ export class PivxWallet {
    * it, then sync again. It needs no keys.
    */
   reloadFromCheckpoint(height: number): void {
-    if (this.busy) throw new Error('wallet is busy');
+    if (this.busy) throw new WalletBusyError();
+    // get_closest_checkpoint takes an i32 in the WASM, which wraps silently: a
+    // NaN/negative/out-of-range height would pick a wrong checkpoint and clear
+    // notes/pending into a stuck resync. Apply the same guard create() applies
+    // to birthHeight, and throw BEFORE any state is cleared.
+    if (!Number.isSafeInteger(height) || height < 0 || height > 0x7fff_ffff) {
+      throw new Error(`height must be an integer in [0, 2^31-1], got ${height}`);
+    }
     const [cpHeight, cpTree] = this.shield.get_closest_checkpoint(height, this.isTestnet) as [
       number,
       string,
@@ -599,7 +711,15 @@ export class PivxWallet {
 
   // ── Spending ──────────────────────────────────────────────────────────────
 
-  /** Load sapling proving parameters (required once before building transactions). */
+  /**
+   * Load sapling proving parameters (required once before building
+   * transactions). All three inputs are SHA256-verified against the pinned
+   * parameter hashes before use (the same integrity check the Rust SDK pins in
+   * prover.rs), so corrupt or substituted params are rejected. For `url`, the
+   * SDK fetches `<url>/sapling-output.params` and `<url>/sapling-spend.params`,
+   * hashes them, and loads via the verified-bytes path — matching Rust's
+   * load_prover_from_url; the raw URL is never handed to the WASM unverified.
+   */
   async loadProver(
     source: { path: string } | { url: string } | { spend: Uint8Array; output: Uint8Array },
   ): Promise<void> {
@@ -611,10 +731,24 @@ export class PivxWallet {
         readFile(join(source.path, 'sapling-output.params')),
         readFile(join(source.path, 'sapling-spend.params')),
       ]);
+      verifyProvingParams(output, spend);
       ok = await this.shield.load_prover_with_bytes(output, spend);
     } else if ('url' in source) {
-      ok = await this.shield.load_prover_with_url(source.url);
+      // Fetch the same two params Rust's load_prover_from_url pulls, SHA256-pin
+      // them, then load via the verified-bytes path (never the unpinned WASM URL).
+      const fetchParam = async (name: string): Promise<Uint8Array> => {
+        const res = await fetch(`${source.url}/${name}`);
+        if (!res.ok) throw new Error(`failed to fetch ${name}: HTTP ${res.status}`);
+        return new Uint8Array(await res.arrayBuffer());
+      };
+      const [output, spend] = await Promise.all([
+        fetchParam('sapling-output.params'),
+        fetchParam('sapling-spend.params'),
+      ]);
+      verifyProvingParams(output, spend);
+      ok = await this.shield.load_prover_with_bytes(output, spend);
     } else {
+      verifyProvingParams(source.output, source.spend);
       ok = await this.shield.load_prover_with_bytes(source.output, source.spend);
     }
     if (!ok) throw new Error('failed to load sapling proving parameters');
@@ -652,7 +786,7 @@ export class PivxWallet {
     // awaiting anything. Otherwise two concurrent createTransaction calls could
     // each snapshot the same notes before either set `busy`, then serialize on
     // the guard and both build with the same inputs — a double-spend.
-    if (this.busy) throw new Error('wallet is busy: another sync or spend is in progress');
+    if (this.busy) throw new WalletBusyError();
     this.busy = true;
     try {
       // Spendable notes, minus pending spends and dust. Dust notes (worth no
@@ -664,9 +798,12 @@ export class PivxWallet {
       );
 
       // Refuse a send the inputs can't cover including the fee, unless the
-      // caller opts into sweep. Both branches mirror the Rust selection so the
-      // WASM can't silently pay the fee out of the recipient's amount — the
-      // WASM shares the same fee model but has no such guard.
+      // caller opts into paying the fee out of the recipient's amount. Both
+      // branches mirror the Rust selection so the WASM can't silently pay the
+      // fee out of the recipient's amount — the WASM shares the same fee model
+      // but has no such guard. `sweep` is the deprecated alias for
+      // `subtractFeeFromAmount` (same flag; see types.ts).
+      const subtractFeeFromAmount = opts.subtractFeeFromAmount ?? opts.sweep ?? false;
       const sufficient = useShield
         ? estimateShieldSelection(spendable, opts.amount, this.isShieldAddress(opts.to)).sufficient
         : estimateTransparentSelection(
@@ -674,11 +811,8 @@ export class PivxWallet {
             opts.amount,
             this.isShieldAddress(opts.to),
           ).sufficient;
-      if (!sufficient && !opts.sweep) {
-        throw new Error(
-          'insufficient input value to cover amount + fee; lower the amount, ' +
-            'add inputs, or pass sweep:true to deduct the fee from the recipient',
-        );
+      if (!sufficient && !subtractFeeFromAmount) {
+        throw new InsufficientFundsError();
       }
 
       // Prover is only needed to build; check it after the cheap validations
@@ -686,19 +820,31 @@ export class PivxWallet {
       if (!(await this.shield.prover_is_loaded())) {
         throw new Error('sapling prover not loaded: call loadProver() first');
       }
+      // getNewAddress() advances the shield diversifier cursor, but the
+      // create_transaction call below can still throw (prover/recipient error).
+      // Snapshot the cursor and restore it on failure so a failed send does not
+      // burn an internal address — the Rust twin's plan_transaction does the
+      // same. (Transparent change comes from the caller, no cursor to restore.)
+      const savedDiversifierIndex = this.diversifierIndex;
       const changeAddress = useShield ? this.getNewAddress() : opts.transparentChangeAddress!;
 
-      const result = (await this.shield.create_transaction({
-        notes: useShield ? spendable : null,
-        utxos: useShield ? null : (opts.inputs as TransparentInput[]),
-        extsk: this.extsk,
-        to_address: opts.to,
-        change_address: changeAddress,
-        amount: opts.amount,
-        block_height: this.lastProcessedBlock + 1,
-        is_testnet: this.isTestnet,
-        memo: opts.memo ?? '',
-      })) as { txid: string; txhex: string; nullifiers: string[] };
+      let result: { txid: string; txhex: string; nullifiers: string[] };
+      try {
+        result = (await this.shield.create_transaction({
+          notes: useShield ? spendable : null,
+          utxos: useShield ? null : (opts.inputs as TransparentInput[]),
+          extsk: this.extsk,
+          to_address: opts.to,
+          change_address: changeAddress,
+          amount: opts.amount,
+          block_height: this.lastProcessedBlock + 1,
+          is_testnet: this.isTestnet,
+          memo: opts.memo ?? '',
+        })) as { txid: string; txhex: string; nullifiers: string[] };
+      } catch (err) {
+        if (useShield) this.diversifierIndex = savedDiversifierIndex;
+        throw err;
+      }
 
       if (useShield) this.pendingSpends.set(result.txid, result.nullifiers);
       return { txid: result.txid, hex: result.txhex, nullifiers: result.nullifiers };
@@ -717,11 +863,13 @@ export class PivxWallet {
     } catch (err) {
       // Only release the notes when the node definitively rejected the
       // transaction. On a transport/timeout error the node may have accepted
-      // it, so keep the spend pending — discarding here could let a retry (or
-      // an operator reacting to a false "failed") double-spend or double-pay.
-      // Recover per docs/deployment.md: wait for the txid to confirm or
-      // clearly disappear, then resume.
-      if (err instanceof RpcError) {
+      // it — and some RPC "errors" mean the node already HAS it (see
+      // txMayBeAccepted) — so in both cases keep the spend pending:
+      // discarding here could let a retry (or an operator reacting to a
+      // false "failed") double-spend or double-pay. Recover per
+      // docs/deployment.md: wait for the txid to confirm or clearly
+      // disappear, then finalize/discard.
+      if (err instanceof RpcError && !txMayBeAccepted(err)) {
         this.discardTransaction(tx.txid);
       } else if (err && typeof err === 'object') {
         // Ambiguous failure: the notes stay pending. Attach the txid so the
@@ -807,7 +955,10 @@ export class PivxWallet {
     if (opts.expectedViewingKey !== undefined && opts.expectedViewingKey !== state.extfvk) {
       throw new Error('wallet state viewing key does not match the expected key');
     }
-    if (!Number.isSafeInteger(state.lastProcessedBlock) || !Array.isArray(state.notes)) {
+    // Bound the sync position to [0, 2^53-1] (isSafeInteger caps the top;
+    // reject negatives), symmetric with scan/handleBlocks height bounds so
+    // downstream block_height math can't underflow on a tampered state.
+    if (!Number.isSafeInteger(state.lastProcessedBlock) || state.lastProcessedBlock < 0 || !Array.isArray(state.notes)) {
       throw new Error('wallet state has an invalid sync position or notes');
     }
     for (const n of state.notes) {
@@ -824,6 +975,26 @@ export class PivxWallet {
     }
     if (state.pendingSpends !== undefined && (typeof state.pendingSpends !== 'object' || state.pendingSpends === null)) {
       throw new Error('wallet state has an invalid pending-spends map');
+    }
+    // Shape-check the entries too (the Rust SDK's typed deserialization
+    // rejects these for free): pendingSpends values are arrays of nullifier
+    // strings, nullifierMap values carry a recipient string and a sat value.
+    for (const [txid, nulls] of Object.entries(state.pendingSpends ?? {})) {
+      if (!Array.isArray(nulls) || !nulls.every((n) => typeof n === 'string')) {
+        throw new Error(`wallet state has a malformed pending-spends entry: ${txid}`);
+      }
+    }
+    if (state.nullifierMap !== undefined && (typeof state.nullifierMap !== 'object' || state.nullifierMap === null)) {
+      throw new Error('wallet state has an invalid nullifier map');
+    }
+    for (const [nf, entry] of Object.entries(state.nullifierMap ?? {})) {
+      if (
+        typeof entry?.recipient !== 'string' ||
+        !Number.isSafeInteger(entry?.value) ||
+        entry.value < 0
+      ) {
+        throw new Error(`wallet state has a malformed nullifier-map entry: ${nf}`);
+      }
     }
     const shield = await loadShield(opts.proving);
     // Confirm the viewing key decodes for this network before trusting it to

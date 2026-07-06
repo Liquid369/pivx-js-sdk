@@ -87,7 +87,11 @@ function serialize(
     w.bytes(txid.reverse()); // little-endian prevout hash
     w.u32le(input.vout);
     w.script(scriptSigs[i]);
-    w.u32le(0xffffffff); // nSequence
+    // nSequence: 0xffffffff marks the tx final, which makes the node IGNORE
+    // nLockTime (IsFinalTx, src/consensus/tx_verify.cpp). A non-zero locktime
+    // therefore needs a non-final sequence; 0xfffffffe keeps the locktime
+    // enforceable without opting in to replacement.
+    w.u32le(locktime !== 0 ? 0xfffffffe : 0xffffffff);
   });
   w.varint(outputs.length);
   for (const [script, value] of outputs) {
@@ -141,5 +145,16 @@ export function buildTransparentTx(inputs: TxInput[], outputs: TxOutput[], lockt
     scriptSigs[i] = ss.done();
   });
 
-  return bytesToHex(serialize(inputs, scriptSigs, outScripts, locktime));
+  const raw = serialize(inputs, scriptSigs, outScripts, locktime);
+  // PIVX policy rejects any tx AT or above MAX_STANDARD_TX_SIZE (`sz >=
+  // 100000`, src/policy/policy.cpp IsStandardTx), so never return one.
+  // Callers estimate sizes before selecting inputs; this re-checks the ACTUAL
+  // serialized size as insurance against estimator drift, and runs before the
+  // wallet's buildSend reserves anything (it reserves only after this returns).
+  if (raw.length >= 100_000) {
+    throw new Error(
+      'transaction would exceed the 100kB standard size (too many small inputs); consolidate UTXOs first',
+    );
+  }
+  return bytesToHex(raw);
 }

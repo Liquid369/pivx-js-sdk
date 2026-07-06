@@ -8,6 +8,7 @@ import type {
   DecodedTransaction,
   EstimateSmartFee,
   ListSinceBlock,
+  MasternodeCount,
   MempoolEntry,
   MempoolInfo,
   MiningInfo,
@@ -73,6 +74,36 @@ export class AuthError extends Error {
   }
 }
 
+/** Response envelope was not a well-formed JSON-RPC object (non-JSON body,
+ * null/primitive/array, a malformed batch element, or a mismatched id).
+ * Parity with the Rust SDK's `Error::Json`. */
+export class MalformedResponseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MalformedResponseError';
+  }
+}
+
+/** Response body exceeded the configured size cap
+ * ({@link PivxClientOptions.maxResponseBytes}). Parity with the Rust SDK's
+ * `Error::ResponseTooLarge`. */
+export class ResponseTooLargeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResponseTooLargeError';
+  }
+}
+
+/** Network/transport failure reaching the node (fetch rejected, timeout
+ * abort). The original error is kept as `cause`. Parity with the Rust SDK's
+ * `Error::Transport`. */
+export class TransportError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'TransportError';
+  }
+}
+
 let nextId = 0;
 
 export class PivxClient {
@@ -84,8 +115,25 @@ export class PivxClient {
   private readonly maxResponseBytes: number;
 
   constructor(opts: PivxClientOptions = {}) {
+    if (opts.url !== undefined) {
+      // fetch() rejects URLs carrying userinfo, so catch it early with a
+      // pointer to the supported mechanism (same contract as the Rust SDK).
+      let parsed: URL | undefined;
+      try {
+        parsed = new URL(opts.url);
+      } catch {
+        /* a malformed URL fails in fetch() with the method-labeled wrapper */
+      }
+      if (parsed && (parsed.username !== '' || parsed.password !== '')) {
+        throw new Error(
+          'credentials in the URL are not supported; use the user/pass options instead',
+        );
+      }
+    }
     const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
-    this.url = opts.wallet ? `${base.replace(/\/$/, '')}/wallet/${opts.wallet}` : base;
+    this.url = opts.wallet
+      ? `${base.replace(/\/$/, '')}/wallet/${encodeURIComponent(opts.wallet)}`
+      : base;
     if (opts.user !== undefined) {
       this.authHeader = PivxClient.basicAuth(opts.user, opts.pass ?? '');
     }
@@ -136,16 +184,23 @@ export class PivxClient {
     return PivxClient.basicAuth(line.slice(0, sep), line.slice(sep + 1));
   }
 
-  private post(body: string): Promise<Response> {
-    return fetch(this.url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(this.authHeader ? { authorization: this.authHeader } : {}),
-      },
-      body,
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+  private async post(body: string, label: string, timeoutMs: number): Promise<Response> {
+    try {
+      return await fetch(this.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.authHeader ? { authorization: this.authHeader } : {}),
+        },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      // A bare "fetch failed" / timeout abort says nothing about which RPC was
+      // in flight; label it with the method (original error kept as cause).
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new TransportError(`${label}: transport failure: ${msg}`, { cause: err });
+    }
   }
 
   /**
@@ -158,14 +213,14 @@ export class PivxClient {
    * is an IP/ACL denial a cookie can't fix, so it is not retried. An
    * unreadable cookie counts as unchanged and falls through to AuthError.
    */
-  private async send(payload: string, label: string): Promise<Response> {
-    let res = await this.post(payload);
+  private async send(payload: string, label: string, timeoutMs = this.timeoutMs): Promise<Response> {
+    let res = await this.post(payload, label, timeoutMs);
     if (res.status === 401 && this.cookiePath) {
       const fresh = await PivxClient.readCookie(this.cookiePath).catch(() => undefined);
       if (fresh !== undefined && fresh !== this.authHeader) {
         this.authHeader = fresh;
         await res.body?.cancel().catch(() => {});
-        res = await this.post(payload);
+        res = await this.post(payload, label, timeoutMs);
       }
     }
     if (res.status === 401 || res.status === 403) throw new AuthError(label, res.status);
@@ -173,21 +228,40 @@ export class PivxClient {
   }
 
   /** Raw JSON-RPC call. Trailing undefined params are trimmed. */
-  async call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
+  call<T = unknown>(method: string, ...params: unknown[]): Promise<T> {
+    return this.callWithTimeout<T>(this.timeoutMs, method, params);
+  }
+
+  /** {@link call} with a per-request timeout (rescanning key imports run far
+   * longer than the default request timeout). */
+  private async callWithTimeout<T>(timeoutMs: number, method: string, params: unknown[]): Promise<T> {
     while (params.length > 0 && params[params.length - 1] === undefined) params.pop();
-    const payload = JSON.stringify({ jsonrpc: '1.0', id: ++nextId, method, params });
-    const res = await this.send(payload, method);
+    const id = ++nextId;
+    const payload = JSON.stringify({ jsonrpc: '1.0', id, method, params });
+    const res = await this.send(payload, method, timeoutMs);
     // Read the body with a hard byte cap so a hostile node can't exhaust
     // memory. Streaming means the cap holds even without a Content-Length.
     const raw = await this.readCapped(res, method);
-    let body: { result?: T; error?: { code: number; message: string } | null };
+    let parsed: unknown;
     try {
-      body = JSON.parse(raw) as typeof body;
+      parsed = JSON.parse(raw);
     } catch {
-      throw new Error(`${method}: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
+      throw new MalformedResponseError(`${method}: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
     }
+    // A JSON-RPC response is one object; a hostile/broken endpoint can hand
+    // back null, a bare primitive, or an array — fail with a labeled error
+    // instead of crashing on property access.
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new MalformedResponseError(`${method}: malformed response (expected a JSON object)`);
+    }
+    const body = parsed as { result?: T; error?: { code: number; message: string } | null; id?: unknown };
     if (body.error) throw new RpcError(body.error.code, body.error.message, method);
     if (!res.ok) throw new Error(`${method}: HTTP ${res.status} ${res.statusText}`);
+    if (body.id !== id) {
+      throw new MalformedResponseError(
+        `${method}: response id mismatch (sent ${id}, got ${String(body.id)})`,
+      );
+    }
     return body.result as T;
   }
 
@@ -202,31 +276,72 @@ export class PivxClient {
     calls: { method: string; params?: unknown[] }[],
   ): Promise<Array<{ result: unknown } | { error: { code: number; message: string } }>> {
     if (calls.length === 0) throw new Error('batch: no calls provided');
+    // Capture each sub-request's id so responses can be matched by id, not
+    // array position (pivxd preserves order, but a broken proxy could not).
+    const ids = calls.map(() => ++nextId);
     const payload = JSON.stringify(
-      calls.map((c) => ({ jsonrpc: '1.0', id: ++nextId, method: c.method, params: c.params ?? [] })),
+      calls.map((c, i) => ({ jsonrpc: '1.0', id: ids[i], method: c.method, params: c.params ?? [] })),
     );
     const res = await this.send(payload, 'batch');
     const raw = await this.readCapped(res, 'batch');
-    let arr: { result?: unknown; error?: { code: number; message: string } | null }[];
+    let parsed: unknown;
     try {
-      arr = JSON.parse(raw);
+      parsed = JSON.parse(raw);
     } catch {
-      throw new Error(`batch: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
+      throw new MalformedResponseError(`batch: HTTP ${res.status} ${res.statusText} (non-JSON response)`);
     }
-    if (!Array.isArray(arr)) throw new Error(`batch: expected a JSON array response`);
-    if (arr.length !== calls.length) {
-      throw new Error(`batch: node returned ${arr.length} results for ${calls.length} calls`);
+    if (!Array.isArray(parsed)) {
+      // A whole-request failure (parse error, oversized batch, …) comes back
+      // as a single error object — surface the node's code/message. Check that
+      // first (it rides on HTTP 500) so it stays an RpcError, then fall through
+      // to the status check for a non-array, non-error body.
+      const whole =
+        typeof parsed === 'object' && parsed !== null
+          ? (parsed as { error?: { code: number; message: string } | null }).error
+          : undefined;
+      if (whole) throw new RpcError(whole.code, whole.message, 'batch');
+      if (!res.ok) throw new Error(`batch: HTTP ${res.status} ${res.statusText}`);
+      throw new MalformedResponseError(`batch: expected a JSON array response`);
     }
-    return arr.map((el) =>
-      el.error == null
-        ? { result: el.result }
-        : { error: { code: el.error.code, message: el.error.message } },
-    );
+    // A JSON array on a non-2xx status is a hostile/broken endpoint (pivxd
+    // returns 200 for a batch even when individual calls error); reject it,
+    // matching the single-call `if (!res.ok)` and Rust batch's Error::Http.
+    if (!res.ok) throw new Error(`batch: HTTP ${res.status} ${res.statusText}`);
+    if (parsed.length !== calls.length) {
+      throw new MalformedResponseError(
+        `batch: node returned ${parsed.length} results for ${calls.length} calls`,
+      );
+    }
+    // Index each element by its id. A null/primitive entry must not crash on
+    // property access; a non-number id simply won't match any request below.
+    const byId = new Map<
+      number,
+      { result?: unknown; error?: { code: number; message: string } | null }
+    >();
+    for (const el of parsed) {
+      if (typeof el !== 'object' || el === null || Array.isArray(el)) {
+        throw new MalformedResponseError('batch: malformed response element (expected a JSON object)');
+      }
+      byId.set((el as { id?: unknown }).id as number, el);
+    }
+    // Reassemble in request order by matching each request id to its element,
+    // so a reordered response is still attributed correctly and a missing or
+    // mismatched id is a labeled error rather than a mis-attributed result.
+    return ids.map((id) => {
+      const one = byId.get(id);
+      if (one === undefined) {
+        throw new MalformedResponseError(`batch: no response element for request id ${id}`);
+      }
+      return one.error == null
+        ? { result: one.result }
+        : { error: { code: one.error.code, message: one.error.message } };
+    });
   }
 
   /** Read a response body as text, aborting once it exceeds maxResponseBytes. */
   private async readCapped(res: Response, method: string): Promise<string> {
-    const tooBig = () => new Error(`${method}: response exceeds ${this.maxResponseBytes} bytes`);
+    const tooBig = () =>
+      new ResponseTooLargeError(`${method}: response exceeds ${this.maxResponseBytes} bytes`);
     const declared = Number(res.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > this.maxResponseBytes) throw tooBig();
     if (!res.body) {
@@ -252,10 +367,19 @@ export class PivxClient {
     return out + decoder.decode();
   }
 
+  /** One-line runtime guard for money/txid-bearing results: a mistyped amount
+   * must fail loudly here, not propagate NaN into caller arithmetic. */
+  private static expect<T>(value: T, type: 'number' | 'string', method: string): T {
+    if (typeof value !== type) {
+      throw new Error(`${method}: expected a ${type} result, got ${typeof value}`);
+    }
+    return value;
+  }
+
   // ── Blockchain ────────────────────────────────────────────────────────────
 
-  getBlockCount() {
-    return this.call<number>('getblockcount');
+  async getBlockCount() {
+    return PivxClient.expect(await this.call<number>('getblockcount'), 'number', 'getblockcount');
   }
 
   getBestBlockHash() {
@@ -334,8 +458,8 @@ export class PivxClient {
 
   // ── Transparent wallet ────────────────────────────────────────────────────
 
-  getBalance() {
-    return this.call<number>('getbalance');
+  async getBalance() {
+    return PivxClient.expect(await this.call<number>('getbalance'), 'number', 'getbalance');
   }
 
   getNewAddress(label?: string) {
@@ -346,8 +470,12 @@ export class PivxClient {
     return this.call<Unspent[]>('listunspent', minConf, maxConf, addresses);
   }
 
-  sendToAddress(address: string, amount: number, comment?: string) {
-    return this.call<string>('sendtoaddress', address, amount, comment);
+  async sendToAddress(address: string, amount: number, comment?: string) {
+    return PivxClient.expect(
+      await this.call<string>('sendtoaddress', address, amount, comment),
+      'string',
+      'sendtoaddress',
+    );
   }
 
   getTransaction(txid: string, includeWatchOnly = false) {
@@ -432,8 +560,12 @@ export class PivxClient {
   }
 
   /** Total shield balance, or the balance of one shield address ("*" = all). */
-  getShieldBalance(address = '*', minConf = 1, includeWatchOnly = false) {
-    return this.call<number>('getshieldbalance', address, minConf, includeWatchOnly);
+  async getShieldBalance(address = '*', minConf = 1, includeWatchOnly = false) {
+    return PivxClient.expect(
+      await this.call<number>('getshieldbalance', address, minConf, includeWatchOnly),
+      'number',
+      'getshieldbalance',
+    );
   }
 
   listShieldUnspent(
@@ -452,6 +584,9 @@ export class PivxClient {
   /**
    * Build, prove, and broadcast a shielded transaction from the node wallet.
    * Synchronous in PIVX: resolves with the txid once accepted.
+   *
+   * An omitted `fee` lets the node compute the minimum fee (fee=0 on the wire
+   * is identical: rpcwallet.cpp "If nFee=0 leave the default").
    */
   shieldSendMany(
     from: ShieldSendSource,
@@ -460,17 +595,28 @@ export class PivxClient {
     fee?: number,
     subtractFeeFrom?: string[],
   ) {
-    return this.call<string>('shieldsendmany', from, recipients, minConf, fee, subtractFeeFrom);
+    // Interior undefineds serialize to null, which pivxd rejects (get_int /
+    // AmountFromValue) — substitute the node's own defaults instead.
+    return this.call<string>(
+      'shieldsendmany',
+      from,
+      recipients,
+      minConf ?? 1,
+      fee ?? 0,
+      subtractFeeFrom,
+    );
   }
 
-  /** Build and prove a shielded transaction but do not broadcast; returns raw hex. */
+  /** Build and prove a shielded transaction but do not broadcast; returns raw
+   * hex. Omitted `minConf`/`fee` use the node defaults (1 / computed fee). */
   rawShieldSendMany(
     from: ShieldSendSource,
     recipients: ShieldRecipient[],
     minConf?: number,
     fee?: number,
   ) {
-    return this.call<string>('rawshieldsendmany', from, recipients, minConf, fee);
+    // Same interior-null substitution as shieldSendMany.
+    return this.call<string>('rawshieldsendmany', from, recipients, minConf ?? 1, fee ?? 0);
   }
 
   /** Decrypted view of a wallet shielded transaction (amounts, memos). */
@@ -488,23 +634,61 @@ export class PivxClient {
     return this.call<string>('exportsaplingkey', shieldAddr);
   }
 
+  /** Import a sapling spending key. `rescan` defaults to `"whenkeyisnew"`;
+   * `height` rescans from that block. Unless `rescan` is `"no"`, the request
+   * timeout is raised to at least 10 minutes — a wallet rescan blocks the
+   * node well past the default 30s. */
   importSaplingKey(key: string, rescan?: 'yes' | 'no' | 'whenkeyisnew', height?: number) {
-    return this.call<{ address: string }>('importsaplingkey', key, rescan, height);
+    return this.callWithTimeout<{ address: string }>(
+      rescan === 'no' ? this.timeoutMs : Math.max(this.timeoutMs, 600_000),
+      'importsaplingkey',
+      PivxClient.importKeyParams(key, rescan, height),
+    );
+  }
+
+  /** pivxd reads rescan with get_str() and height with get_int() — both
+   * reject null, so when height is given without rescan the node default is
+   * substituted rather than sending an interior null. */
+  private static importKeyParams(
+    key: string,
+    rescan?: 'yes' | 'no' | 'whenkeyisnew',
+    height?: number,
+  ): unknown[] {
+    const params: unknown[] = [key];
+    if (rescan !== undefined || height !== undefined) params.push(rescan ?? 'whenkeyisnew');
+    if (height !== undefined) params.push(height);
+    return params;
   }
 
   exportSaplingViewingKey(shieldAddr: string) {
     return this.call<string>('exportsaplingviewingkey', shieldAddr);
   }
 
-  /** Import an incoming viewing key for watch-only shield balance tracking. */
+  /** Import an incoming viewing key for watch-only shield balance tracking.
+   * Same `rescan` defaults and long-rescan timeout as {@link importSaplingKey}. */
   importSaplingViewingKey(vkey: string, rescan?: 'yes' | 'no' | 'whenkeyisnew', height?: number) {
-    return this.call<{ address: string }>('importsaplingviewingkey', vkey, rescan, height);
+    return this.callWithTimeout<{ address: string }>(
+      rescan === 'no' ? this.timeoutMs : Math.max(this.timeoutMs, 600_000),
+      'importsaplingviewingkey',
+      PivxClient.importKeyParams(vkey, rescan, height),
+    );
   }
 
   // ── Masternode ──────────────────────────────────────────────────────────────
 
-  getMasternodeCount() {
-    return this.call<number>('getmasternodecount');
+  /** Masternode network totals. Throws an {@link RpcError} (code 0) when the
+   * node has no chain tip yet — pivxd returns the bare string "unknown" in
+   * that state instead of the object (same `Error::Rpc` classification as the
+   * Rust SDK). Any other non-object result is a malformed response. */
+  async getMasternodeCount(): Promise<MasternodeCount> {
+    const res = await this.call<MasternodeCount | 'unknown'>('getmasternodecount');
+    if (res === 'unknown') {
+      throw new RpcError(0, 'node has no chain tip yet', 'getmasternodecount');
+    }
+    if (res === null || typeof res !== 'object' || Array.isArray(res)) {
+      throw new MalformedResponseError('getmasternodecount: malformed response (expected a JSON object)');
+    }
+    return res;
   }
 
   /** Legacy masternode list; filter matches address/txhash/status/etc.
@@ -532,7 +716,16 @@ export class PivxClient {
 
   /** Deterministic masternode list. All args optional (node defaults). */
   protxList(detailed?: boolean, walletOnly?: boolean, validOnly?: boolean, height?: number) {
-    return this.call<unknown[]>('protx_list', detailed, walletOnly, validOnly, height);
+    // Every positional arg is read by pivxd with an unguarded get_bool()/
+    // get_int(), so an interior null is rejected — substitute the node's own
+    // defaults; height stays trailing/optional.
+    return this.call<unknown[]>(
+      'protx_list',
+      detailed ?? true,
+      walletOnly ?? false,
+      validOnly ?? false,
+      height,
+    );
   }
 
   // ── Budget / governance ───────────────────────────────────────────────────────
@@ -556,8 +749,12 @@ export class PivxClient {
     return this.call<StakingAddress[]>('liststakingaddresses');
   }
 
-  getColdStakingBalance() {
-    return this.call<number>('getcoldstakingbalance');
+  async getColdStakingBalance() {
+    return PivxClient.expect(
+      await this.call<number>('getcoldstakingbalance'),
+      'number',
+      'getcoldstakingbalance',
+    );
   }
 
   // ── Network / mempool / mining / util ─────────────────────────────────────────

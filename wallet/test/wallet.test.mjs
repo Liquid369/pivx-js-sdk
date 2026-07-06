@@ -6,7 +6,10 @@ import { EXTSK, SHIELD_ADDRESS, TX_HEX } from './fixtures.mjs';
 // These tests run the real pivx-shield WASM: real key derivation, real note
 // decryption against a known regtest transaction. No mocks.
 
-const BIRTH = 100;
+// Above testnet sapling activation (201): the fixture blocks carry a shielded
+// tx, which handleBlocks silently skips below activation (W3), so it must
+// land at/above activation to be credited.
+const BIRTH = 300;
 
 test('key derivation is deterministic and network-correct', async () => {
   const seed = new Uint8Array(32).fill(7);
@@ -21,6 +24,37 @@ test('key derivation is deterministic and network-correct', async () => {
   assert.match(mainnet.getNewAddress(), /^ps1/);
   // different coin type -> different keys
   assert.notEqual(mainnet.getNewAddress(), addrA);
+});
+
+// W-SEED (funds-critical): shield accepts a 64-byte BIP39 seed and derives from
+// its first 32 bytes only (the WASM truncates), so a 64-byte seed and its first
+// 32 bytes yield the same shield key. Runs the real WASM.
+test('W-SEED: shield accepts a 64-byte BIP39 seed; first 32 bytes derive the same key', async () => {
+  const seed64 = Uint8Array.from(
+    ('5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1' +
+      '9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4')
+      .match(/../g)
+      .map((b) => parseInt(b, 16)),
+  );
+  const a = await PivxWallet.create({ seed: seed64, network: 'mainnet', birthHeight: BIRTH });
+  const b = await PivxWallet.create({ seed: seed64.slice(0, 32), network: 'mainnet', birthHeight: BIRTH });
+  // Same viewing key + same receive address ⇒ same spending key (WASM truncates).
+  assert.equal(JSON.parse(a.save()).extfvk, JSON.parse(b.save()).extfvk);
+  assert.equal(a.getNewAddress(), b.getNewAddress());
+  // A length other than 32 or 64 is rejected.
+  await assert.rejects(
+    PivxWallet.create({ seed: new Uint8Array(31), network: 'mainnet', birthHeight: BIRTH }),
+    /seed must be/,
+  );
+});
+
+// W6: a birthHeight the WASM would wrap to i32 (NaN, negative, or > 2^31-1) is
+// rejected rather than silently rescanning from genesis or skipping past deposits.
+test('W6: create rejects an out-of-range birthHeight', async () => {
+  const seed = new Uint8Array(32).fill(7);
+  await assert.rejects(PivxWallet.create({ seed, network: 'testnet', birthHeight: NaN }), /birthHeight/);
+  await assert.rejects(PivxWallet.create({ seed, network: 'testnet', birthHeight: -1 }), /birthHeight/);
+  await assert.rejects(PivxWallet.create({ seed, network: 'testnet', birthHeight: 2 ** 40 }), /birthHeight/);
 });
 
 test('scans a real transaction into a spendable note (spending key)', async () => {

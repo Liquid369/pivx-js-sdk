@@ -5,7 +5,16 @@ import { once } from 'node:events';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PivxClient, RpcError, AuthError, ShieldWatcher } from '../dist/index.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import {
+  PivxClient,
+  RpcError,
+  AuthError,
+  MalformedResponseError,
+  ResponseTooLargeError,
+  TransportError,
+  ShieldWatcher,
+} from '../dist/index.js';
 
 /** Stub pivxd: responds per-method from `handlers`, records requests. */
 async function stubNode(handlers) {
@@ -16,7 +25,7 @@ async function stubNode(handlers) {
       req.on('data', (c) => (data += c));
       req.on('end', () => r(data));
     }));
-    requests.push({ auth: req.headers.authorization, body });
+    requests.push({ auth: req.headers.authorization, url: req.url, body });
     const out = handlers[body.method]?.(body.params) ?? { error: { code: -32601, message: 'Method not found' } };
     res.setHeader('content-type', 'application/json');
     if (out.error) res.statusCode = 500;
@@ -70,15 +79,20 @@ test('node errors surface as RpcError with code intact', async () => {
 /** Stub node that 401s unless the request carries `expected()` basic auth. */
 async function authNode(expected) {
   let hits = 0;
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     hits++;
+    const body = JSON.parse(await new Promise((r) => {
+      let data = '';
+      req.on('data', (c) => (data += c));
+      req.on('end', () => r(data));
+    }));
     if (req.headers.authorization !== expected()) {
       res.statusCode = 401;
       res.end();
       return;
     }
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ id: 1, result: 42, error: null }));
+    res.end(JSON.stringify({ id: body.id, result: 42, error: null }));
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -374,8 +388,9 @@ test('listTransactions injects dummy "*", sendMany injects dummy "", abandonTran
   }
 });
 
-/** Batch stub: echoes the request array, replies with a JSON array of results. */
-async function batchNode(reply) {
+/** Batch stub: echoes the request array, replies with a JSON array of results
+ * at the given HTTP status (default 200). */
+async function batchNode(reply, status = 200) {
   let received;
   const server = createServer(async (req, res) => {
     received = JSON.parse(await new Promise((r) => {
@@ -383,6 +398,7 @@ async function batchNode(reply) {
       req.on('data', (c) => (d += c));
       req.on('end', () => r(d));
     }));
+    res.statusCode = status;
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify(reply(received)));
   });
@@ -429,6 +445,43 @@ test('batch rejects a node result-count mismatch', async () => {
     await assert.rejects(
       client.batch([{ method: 'getblockcount' }, { method: 'getbestblockhash' }]),
       /1 results for 2 calls/,
+    );
+  } finally {
+    node.close();
+  }
+});
+
+test('batch attributes reordered response elements by id', async () => {
+  // Node returns the two results in the opposite order; matching by id must
+  // still map each result to the correct call.
+  const node = await batchNode((reqs) => [
+    { id: reqs[1].id, result: 'second', error: null },
+    { id: reqs[0].id, result: 42, error: null },
+  ]);
+  try {
+    const client = new PivxClient({ port: node.port });
+    const out = await client.batch([
+      { method: 'getblockcount' },
+      { method: 'getbestblockhash' },
+    ]);
+    assert.deepEqual(out, [{ result: 42 }, { result: 'second' }]);
+  } finally {
+    node.close();
+  }
+});
+
+test('batch rejects an element whose id matches no request', async () => {
+  // Second element carries an id no request used → request id N has no reply,
+  // so the batch cannot be attributed and fails with a labeled error.
+  const node = await batchNode((reqs) => [
+    { id: reqs[0].id, result: 42, error: null },
+    { id: reqs[0].id + 100000, result: 7, error: null },
+  ]);
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(
+      client.batch([{ method: 'getblockcount' }, { method: 'getbestblockhash' }]),
+      /batch: no response element for request id/,
     );
   } finally {
     node.close();
@@ -543,6 +596,415 @@ test('getRawMempool: txid array (non-verbose) and keyed MempoolEntry objects (ve
     assert.equal(verbose.abc.size, 200);
     assert.equal(verbose.abc.descendantfees, 10000);   // raw satoshis (integer), not PIV
     assert.equal(verbose.abc.depends.length, 0);
+  } finally {
+    node.close();
+  }
+});
+
+/** Server that replies with a fixed raw body regardless of the request. */
+async function rawNode(rawBody, status = 200) {
+  const server = createServer((req, res) => {
+    res.statusCode = status;
+    res.setHeader('content-type', 'application/json');
+    res.end(rawBody);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return { port: server.address().port, close: () => server.close() };
+}
+
+test('getMasternodeCount: typed object; bare "unknown" (no chain tip) throws RpcError', async () => {
+  let result = { total: 10, stable: 9, enabled: 8, inqueue: 7, ipv4: 6, ipv6: 1, onion: 3 };
+  const node = await stubNode({ getmasternodecount: () => ({ result }) });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const count = await client.getMasternodeCount();
+    assert.equal(count.total, 10);
+    assert.equal(count.stable, 9);
+    assert.equal(count.enabled, 8);
+    assert.equal(count.inqueue, 7);
+    assert.equal(count.ipv4, 6);
+    assert.equal(count.ipv6, 1);
+    assert.equal(count.onion, 3);
+
+    // A node without a chain tip returns the bare string "unknown" — an
+    // RpcError (code 0), so instanceof RpcError matches the Rust SDK's
+    // Error::Rpc classification.
+    result = 'unknown';
+    await assert.rejects(
+      client.getMasternodeCount(),
+      (err) =>
+        err instanceof RpcError &&
+        err.code === 0 &&
+        err.method === 'getmasternodecount' &&
+        /node has no chain tip yet/.test(err.message),
+    );
+
+    // Only the literal "unknown" maps to the chain-tip error. Any other
+    // non-object — including an array, which typeof reports as 'object' —
+    // is a malformed response.
+    for (const bad of [[], 7, 'banana']) {
+      result = bad;
+      await assert.rejects(
+        client.getMasternodeCount(),
+        (err) =>
+          !(err instanceof RpcError) &&
+          /getmasternodecount: malformed response \(expected a JSON object\)/.test(err.message),
+        `result ${JSON.stringify(bad)} must be rejected as malformed`,
+      );
+    }
+  } finally {
+    node.close();
+  }
+});
+
+test('viewShieldTransaction: fee is a money string; value can be the string "unknown"', async () => {
+  const node = await stubNode({
+    viewshieldtransaction: () => ({
+      result: {
+        txid: 't1',
+        fee: '0.00010000', // FormatMoney STRING, exactly as the node emits it
+        spends: [
+          // Undecryptable spend: address/value are the string "unknown", valueSat 0.
+          { spend: 0, txidPrev: 'p1', outputPrev: 0, address: 'unknown', value: 'unknown', valueSat: 0 },
+        ],
+        outputs: [
+          { output: 0, outgoing: false, address: 'ps1x', value: 1.5, valueSat: 150000000, memo: 'f6' },
+        ],
+      },
+    }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const view = await client.viewShieldTransaction('t1');
+    assert.equal(typeof view.fee, 'string');
+    assert.equal(view.fee, '0.00010000');
+    assert.equal(view.spends[0].value, 'unknown');
+    assert.equal(view.spends[0].valueSat, 0);       // the reliable integer field
+    assert.equal(view.outputs[0].value, 1.5);
+    assert.equal(view.outputs[0].valueSat, 150000000);
+  } finally {
+    node.close();
+  }
+});
+
+test('interior optional params are substituted with node defaults, never null', async () => {
+  const node = await stubNode({
+    shieldsendmany: () => ({ result: 'txid1' }),
+    rawshieldsendmany: () => ({ result: 'rawhex' }),
+    importsaplingkey: () => ({ result: { address: 'ps1' } }),
+    importsaplingviewingkey: () => ({ result: { address: 'ps1' } }),
+    protx_list: () => ({ result: [] }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const recip = [{ address: 'ps1x', amount: 1 }];
+    const params = (i) => node.requests[i].body.params;
+
+    // shieldsendmany: minconf defaults to 1; fee 0 = "node computes the fee".
+    await client.shieldSendMany('from_shield', recip);
+    assert.deepEqual(params(0), ['from_shield', recip, 1, 0]);
+    await client.shieldSendMany('from_shield', recip, undefined, 0.001);
+    assert.deepEqual(params(1), ['from_shield', recip, 1, 0.001]);
+    await client.shieldSendMany('from_shield', recip, 5, undefined, ['ps1x']);
+    assert.deepEqual(params(2), ['from_shield', recip, 5, 0, ['ps1x']]);
+
+    await client.rawShieldSendMany('from_shield', recip);
+    assert.deepEqual(params(3), ['from_shield', recip, 1, 0]);
+    await client.rawShieldSendMany('from_shield', recip, undefined, 0.5);
+    assert.deepEqual(params(4), ['from_shield', recip, 1, 0.5]);
+
+    // import keys: rescan default "whenkeyisnew" is substituted only when a
+    // later param (height) would otherwise leave an interior null.
+    await client.importSaplingKey('KEY');
+    assert.deepEqual(params(5), ['KEY']);
+    await client.importSaplingKey('KEY', undefined, 100);
+    assert.deepEqual(params(6), ['KEY', 'whenkeyisnew', 100]);
+    await client.importSaplingKey('KEY', 'yes');
+    assert.deepEqual(params(7), ['KEY', 'yes']);
+    await client.importSaplingViewingKey('VKEY', undefined, 200);
+    assert.deepEqual(params(8), ['VKEY', 'whenkeyisnew', 200]);
+
+    // protx_list: node defaults detailed=true, wallet_only=false, valid_only=false.
+    await client.protxList();
+    assert.deepEqual(params(9), [true, false, false]);
+    await client.protxList(undefined, undefined, undefined, 500);
+    assert.deepEqual(params(10), [true, false, false, 500]);
+    await client.protxList(false, true);
+    assert.deepEqual(params(11), [false, true, false]);
+  } finally {
+    node.close();
+  }
+});
+
+test('hostile top-level JSON bodies (null / primitive / array) fail with labeled errors', async () => {
+  for (const raw of ['null', '5', '"str"', '[]']) {
+    const node = await rawNode(raw);
+    try {
+      const client = new PivxClient({ port: node.port });
+      await assert.rejects(
+        client.call('getblockcount'),
+        /getblockcount: malformed response/,
+        `body ${raw} must be rejected with a labeled error`,
+      );
+    } finally {
+      node.close();
+    }
+  }
+});
+
+test('batch: null/primitive elements fail with a labeled error', async () => {
+  const node = await batchNode(() => [null]);
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(
+      client.batch([{ method: 'getblockcount' }]),
+      /batch: malformed response element/,
+    );
+  } finally {
+    node.close();
+  }
+});
+
+test('batch: whole-request error object surfaces the node code/message as RpcError', async () => {
+  const node = await batchNode(() => ({ error: { code: -32600, message: 'Invalid Request' } }));
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(
+      client.batch([{ method: 'getblockcount' }]),
+      (err) => err instanceof RpcError && err.code === -32600 && /Invalid Request/.test(err.message),
+    );
+  } finally {
+    node.close();
+  }
+});
+
+test('batch: a valid array body on a non-2xx status is rejected (parity with single-call/Rust)', async () => {
+  // Hostile/broken endpoint: correct per-call array but HTTP 500. Without the
+  // status check this was accepted as a normal batch; now it is rejected, like
+  // the single-call `if (!res.ok)` and Rust batch's Error::Http.
+  const node = await batchNode((reqs) => [{ id: reqs[0].id, result: 100, error: null }], 500);
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(client.batch([{ method: 'getblockcount' }]), /batch: HTTP 500/);
+  } finally {
+    node.close();
+  }
+});
+
+test('response id mismatch throws a labeled error', async () => {
+  const node = await rawNode(JSON.stringify({ id: 424242, result: 1, error: null }));
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(client.call('getblockcount'), /getblockcount: response id mismatch/);
+  } finally {
+    node.close();
+  }
+});
+
+test('money-bearing methods reject mistyped results with labeled errors', async () => {
+  const node = await stubNode({
+    getbalance: () => ({ result: '1.5' }),
+    getshieldbalance: () => ({ result: null }),
+    getcoldstakingbalance: () => ({ result: {} }),
+    sendtoaddress: () => ({ result: 42 }),
+    getblockcount: () => ({ result: '100' }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    await assert.rejects(client.getBalance(), /getbalance: expected a number result/);
+    await assert.rejects(client.getShieldBalance(), /getshieldbalance: expected a number result/);
+    await assert.rejects(
+      client.getColdStakingBalance(),
+      /getcoldstakingbalance: expected a number result/,
+    );
+    await assert.rejects(client.sendToAddress('D1', 1), /sendtoaddress: expected a string result/);
+    await assert.rejects(client.getBlockCount(), /getblockcount: expected a number result/);
+  } finally {
+    node.close();
+  }
+});
+
+test('transport failures carry the method name', async () => {
+  // Grab a port that nothing listens on.
+  const probe = createServer();
+  probe.listen(0, '127.0.0.1');
+  await once(probe, 'listening');
+  const port = probe.address().port;
+  probe.close();
+  await once(probe, 'close');
+
+  const client = new PivxClient({ port, timeoutMs: 2000 });
+  await assert.rejects(client.getBlockCount(), /getblockcount: transport failure/);
+});
+
+test('B1: typed rpc error classes (parity with Rust Error::{Json,ResponseTooLarge,Transport})', async () => {
+  // Malformed envelope: a null/primitive/array body → MalformedResponseError.
+  for (const raw of ['null', '5', '"str"', '[]']) {
+    const node = await rawNode(raw);
+    try {
+      const client = new PivxClient({ port: node.port });
+      await assert.rejects(
+        client.call('getblockcount'),
+        (err) => err instanceof MalformedResponseError && err instanceof Error,
+        `body ${raw} must be a MalformedResponseError`,
+      );
+    } finally {
+      node.close();
+    }
+  }
+
+  // Over-cap body → ResponseTooLargeError (content-length exceeds the cap).
+  {
+    const node = await rawNode(JSON.stringify({ id: 0, result: 'x'.repeat(1000), error: null }));
+    try {
+      const client = new PivxClient({ port: node.port, maxResponseBytes: 16 });
+      await assert.rejects(
+        client.call('getblockcount'),
+        (err) => err instanceof ResponseTooLargeError && err instanceof Error,
+      );
+    } finally {
+      node.close();
+    }
+  }
+
+  // Fetch failure (nothing listening) → TransportError, original kept as cause.
+  const probe = createServer();
+  probe.listen(0, '127.0.0.1');
+  await once(probe, 'listening');
+  const port = probe.address().port;
+  probe.close();
+  await once(probe, 'close');
+  const client = new PivxClient({ port, timeoutMs: 2000 });
+  await assert.rejects(
+    client.getBlockCount(),
+    (err) => err instanceof TransportError && err instanceof Error && err.cause !== undefined,
+  );
+});
+
+test('wallet name is URL-encoded in the endpoint path', async () => {
+  const node = await stubNode({ getblockcount: () => ({ result: 1 }) });
+  try {
+    const client = new PivxClient({ port: node.port, wallet: 'my wallet#1' });
+    await client.getBlockCount();
+    assert.equal(node.requests[0].url, '/wallet/my%20wallet%231');
+  } finally {
+    node.close();
+  }
+});
+
+test('constructor rejects credentials embedded in the URL', () => {
+  assert.throws(
+    () => new PivxClient({ url: 'http://user:pass@127.0.0.1:51473' }),
+    /credentials in the URL are not supported/,
+  );
+});
+
+test('importSaplingKey with a rescan outlives the default request timeout', async () => {
+  // The stub answers after 150ms; the client timeout is 50ms. Only the
+  // import calls (rescan not "no") get the raised per-call timeout.
+  const server = createServer(async (req, res) => {
+    const body = JSON.parse(await new Promise((r) => {
+      let d = '';
+      req.on('data', (c) => (d += c));
+      req.on('end', () => r(d));
+    }));
+    await delay(150);
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({
+      id: body.id,
+      result: body.method.startsWith('importsapling') ? { address: 'ps1' } : 1,
+      error: null,
+    }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const client = new PivxClient({ port: server.address().port, timeoutMs: 50 });
+    await assert.rejects(client.getBlockCount(), /transport failure/, 'default timeout applies');
+    assert.deepEqual(await client.importSaplingKey('KEY'), { address: 'ps1' });
+    assert.deepEqual(await client.importSaplingViewingKey('VKEY', 'yes'), { address: 'ps1' });
+    // rescan="no" keeps the default (short) timeout.
+    await assert.rejects(client.importSaplingKey('KEY', 'no'), /transport failure/);
+  } finally {
+    server.close();
+  }
+});
+
+test('ShieldWatcher commits state before emitting: a throwing listener cannot cause re-emission', async () => {
+  const note = (txid, outindex, amount) => ({
+    txid, outindex, confirmations: 2, spendable: false,
+    address: 'ps1watch', amount, memo: '',
+  });
+  let tip = 'aaa';
+  let notes = [];
+  const node = await stubNode({
+    getbestblockhash: () => ({ result: tip }),
+    listshieldunspent: () => ({ result: notes }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const watcher = new ShieldWatcher(client, { addresses: ['ps1watch'] });
+    const seen = [];
+    const errors = [];
+    let boom = true;
+    watcher.on('note', (n) => {
+      seen.push(n.txid);
+      if (boom) {
+        boom = false;
+        throw new Error('listener boom');
+      }
+    });
+    watcher.on('error', (e) => errors.push(e));
+
+    await watcher.poll(); // prime (empty)
+    tip = 'bbb';
+    notes = [note('t1', 0, 5)];
+    await watcher.poll(); // emits t1; the listener throws
+    assert.deepEqual(seen, ['t1']);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].message, /listener boom/);
+
+    await watcher.poll(); // same tip: state was committed, nothing re-emitted
+    assert.deepEqual(seen, ['t1'], 'no re-emission after a throwing listener');
+    assert.equal(watcher.balance, 5, 'balance state was committed despite the throw');
+  } finally {
+    node.close();
+  }
+});
+
+test('ShieldWatcher stop() during an in-flight poll suppresses emits but state still commits', async () => {
+  const note = (txid, outindex, amount) => ({
+    txid, outindex, confirmations: 2, spendable: false,
+    address: 'ps1watch', amount, memo: '',
+  });
+  let tip = 'aaa';
+  let notes = [];
+  const node = await stubNode({
+    getbestblockhash: () => ({ result: tip }),
+    listshieldunspent: () => ({ result: notes }),
+  });
+  try {
+    const client = new PivxClient({ port: node.port });
+    const watcher = new ShieldWatcher(client, { addresses: ['ps1watch'] });
+    const events = [];
+    watcher.on('note', (n) => events.push(['note', n.txid]));
+    watcher.on('block', (h) => events.push(['block', h]));
+    watcher.on('error', (e) => events.push(['error', e.message]));
+
+    // Manual poll without start(): emits normally (not treated as stopped).
+    await watcher.poll(); // prime
+    assert.deepEqual(events, [['block', 'aaa']]);
+
+    tip = 'bbb';
+    notes = [note('t1', 0, 5)];
+    const inflight = watcher.poll(); // suspends at the first RPC await
+    watcher.stop(); // stop before the poll completes
+    await inflight;
+
+    assert.deepEqual(events, [['block', 'aaa']], 'nothing may be emitted after stop()');
+    assert.equal(watcher.balance, 5, 'the in-flight poll still committed state');
+    assert.equal(watcher.unspent.length, 1);
   } finally {
     node.close();
   }

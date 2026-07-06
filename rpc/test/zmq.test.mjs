@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { parseZmqFrame, ZmqSubscriber } from '../dist/index.js';
+import { parseZmqFrame, ZmqSubscriber, ZmqError } from '../dist/index.js';
 
 const utf8 = (s) => new TextEncoder().encode(s);
 const leSeq = (n) => {
@@ -60,6 +60,58 @@ test('parseZmqFrame: bad sequence length throws', () => {
 
 test('parseZmqFrame: short hash body throws', () => {
   assert.throws(() => parseZmqFrame([utf8('hashblock'), new Uint8Array(31), leSeq(1)]), /32 bytes/);
+});
+
+test('B4: parseZmqFrame throws a typed ZmqError (instanceof Error) on a bad-length hash', () => {
+  assert.throws(
+    () => parseZmqFrame([utf8('hashblock'), new Uint8Array(31), leSeq(1)]),
+    (err) => err instanceof ZmqError && err instanceof Error && /32 bytes/.test(err.message),
+  );
+});
+
+/** Fake RawSubscriber yielding canned frames (constructor is TS-private only). */
+const fakeSock = (frames) => ({
+  closed: false,
+  connect() {},
+  subscribe() {},
+  close() { this.closed = true; },
+  async *[Symbol.asyncIterator]() { yield* frames; },
+});
+
+test('ZmqSubscriber skips unknown-topic frames instead of dying', async () => {
+  const fake = fakeSock([
+    [utf8('hashfuture'), new Uint8Array(32), leSeq(1)], // unknown topic (prefix subscription)
+    [utf8('hashblock'), new Uint8Array(32).fill(1), leSeq(2)],
+  ]);
+  const sub = new ZmqSubscriber(fake);
+  const events = [];
+  for await (const ev of sub) events.push(ev);
+  assert.equal(events.length, 1, 'unknown-topic frame skipped, known frame delivered');
+  assert.equal(events[0].topic, 'hashblock');
+  assert.equal(events[0].sequence, 2);
+  assert.equal(events[0].hash, '01'.repeat(32));
+  assert.ok(fake.closed, 'socket closed when iteration ends');
+});
+
+test('ZmqSubscriber: malformed frame on a known topic throws AND closes the socket', async () => {
+  const fake = fakeSock([[utf8('hashblock'), new Uint8Array(31), leSeq(1)]]); // short hash
+  const sub = new ZmqSubscriber(fake);
+  await assert.rejects(
+    (async () => { for await (const ev of sub) void ev; })(),
+    /32 bytes/,
+  );
+  assert.ok(fake.closed, 'socket closed when the iterator throws');
+  sub.close(); // close() is idempotent
+});
+
+test('ZmqSubscriber: breaking out of iteration closes the socket', async () => {
+  const fake = fakeSock([
+    [utf8('hashblock'), new Uint8Array(32), leSeq(1)],
+    [utf8('hashblock'), new Uint8Array(32), leSeq(2)],
+  ]);
+  const sub = new ZmqSubscriber(fake);
+  for await (const ev of sub) { void ev; break; }
+  assert.ok(fake.closed, 'socket closed on early break');
 });
 
 test('ZmqSubscriber: publisher → subscriber round-trip yields a typed event', async () => {

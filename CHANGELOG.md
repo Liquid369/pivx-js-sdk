@@ -5,6 +5,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-06
+
+Release of a full-repo audit cycle: `pivx-rpc` 0.6.0, `pivx-wallet` 0.4.0.
+
+### Fixed
+
+- `pivx-rpc`: `getMasternodeCount` now returns the node's real result object
+  (`total`/`stable`/`enabled`/`inqueue`/`ipv4`/`ipv6`/`onion`) instead of a
+  number, and throws a typed `RpcError` ("node has no chain tip yet") for the
+  node's bare-string `"unknown"` reply. **Breaking** for callers that typed
+  the old `number`.
+- `pivx-rpc`: `ShieldTxView.fee` is typed as the money-formatted string the
+  node actually emits, and spend/output `value` as `number | 'unknown'`;
+  `valueSat` remains the reliable integer field. **Breaking** type change.
+- `pivx-rpc`: optional middle parameters (`shieldSendMany`,
+  `rawShieldSendMany`, `importSaplingKey`, `importSaplingViewingKey`,
+  `protxList`) now substitute the node's defaults instead of serializing
+  `null`, which pivxd rejects.
+- `pivx-rpc`: hostile or malformed node responses (top-level `null`,
+  primitives, arrays, batch elements) fail with labeled errors instead of
+  crashing or silently returning `undefined`; JSON-RPC response ids are
+  verified; whole-batch error objects surface the node's code and message;
+  money-returning methods validate the result type at runtime.
+- `pivx-rpc`: `ShieldWatcher` commits its state before emitting events, so a
+  throwing listener can no longer cause duplicate `note`/`spent` events on
+  the next poll; watchers no longer emit after `stop()`.
+- `pivx-rpc`: `WatchOptions.includeWatchOnly` (default `true`) is now mirrored
+  by the Rust SDK, which renamed its inverted `exclude_watch_only` flag to
+  `include_watch_only` to match — both SDKs share one watch-only polarity. JS
+  callers are unaffected (the field name is unchanged).
+- `pivx-rpc`: ZMQ subscription iterators skip frames for unknown topics
+  (tolerating prefix subscriptions) and close the socket on termination.
+- `pivx-rpc`: sapling key imports that trigger a rescan use a 10-minute
+  per-call timeout so the client no longer aborts an import the node
+  completes; wallet names are URL-encoded; URLs carrying credentials are
+  rejected with guidance to use the `user`/`pass` options.
+- `pivx-wallet` transparent: transactions are capped below PIVX's 100 kB
+  standard-size limit (checked on the estimate during selection and on the
+  actual serialized bytes before any reservation); fee rates below the
+  node's 10 sat/byte relay floor are rejected up front; coinstake detection
+  now matches the node (zero value **and** empty script), so a zero-value
+  `OP_RETURN`-first transaction paying the wallet is no longer wrongly
+  maturity-gated.
+- `pivx-wallet` transparent: everything the wallet persists it can load
+  again — `addUtxo` and block scanning validate inputs with the same
+  predicates `load()` enforces, re-scanning a block can no longer produce a
+  scanned-hash window `load()` rejects, and scan/reset heights are validated
+  (integer, non-negative, cross-SDK bounds) before any state changes.
+- `pivx-wallet` transparent: UTXO reservations survive `resetScan`, so a
+  reorg walk-back can no longer allow the same output to be selected twice
+  while a broadcast is in flight; `resetScan` rejects heights above the last
+  scanned block; `getUtxos()` returns copies rather than live internals.
+- `pivx-wallet` shield: below Sapling activation, version-3 transactions are
+  excluded from scanning (fabricated shielded data is never credited) without
+  failing on consensus-legal data; `send()` keeps the pending spend when the
+  node's reply means the transaction was accepted or the notes are contested
+  (`already in block chain`, `bad-txns-nullifier-double-spent`,
+  `bad-txns-shielded-requirements-not-met`), preventing double-pay retries;
+  a failed transaction plan no longer advances the change-address index.
+- `pivx-wallet`: `ScanDivergedError` guidance and the docs converge on
+  `reloadFromCheckpoint()` as the recovery API, and recovery docs warn that
+  pending spends are dropped (reconcile in-flight broadcasts first).
+- `pivx-wallet`: typed spend-guard errors — a send whose funds cannot cover
+  amount + fee throws `InsufficientFundsError` (message points at
+  `subtractFeeFromAmount`), and a wallet call made while another mutation is
+  in flight throws `WalletBusyError` rather than racing.
+- `pivx-wallet`: the `createTransaction`/`send` option `sweep` is renamed to
+  `subtractFeeFromAmount`; the `sweep` alias still works but is deprecated and
+  will be removed in a future release.
+
+### Added
+
+- `pivx-wallet`: `spendableBalance()` — the balance the wallet can actually
+  spend now (maturity- and reservation-aware), alongside `balance()`.
+- `pivx-wallet` transparent: `buildTransparentTx` honors a non-zero locktime
+  by setting non-final input sequences.
+- Test suites covering batch rollback with credited notes, checkpoint
+  walk-back adoption, crash-recovery reconciliation, reorg re-credit,
+  send-error branches, memo round-trips (cross-SDK fixtures built by the
+  Rust SDK and decrypted by the JS WASM), and hostile-input state handling.
+
+## [0.6.2] - 2026-07-05
+
+### Fixed
+
+- `pivx-wallet`: the tip sapling-root check now runs at exact checkpoint
+  heights, not only above them, so a same-height reorg landing on a bundled
+  checkpoint is caught.
+- `pivx-wallet`: the tip-root and batch-scan root checks are skipped below
+  Sapling activation, where the node reports a zero root against the non-zero
+  empty tree (matching the checkpoint validator). The SDK now uses the
+  consensus V5 activation heights (mainnet 2700500, testnet 201) and fetches
+  the tip root with `getblock` verbosity 1.
+- `pivx-wallet` transparent wallet: `buildSend` is refused while a sync is in
+  progress, so a spend cannot reserve a UTXO a concurrent reorg reset is
+  about to drop.
+- `pivx-wallet` transparent wallet: the scanned-hash window is validated on
+  load (bounded, strictly ascending, no future heights), so malformed state
+  cannot misdirect the reorg walk-back.
+
 ## [0.6.1] - 2026-07-04
 
 ### Fixed

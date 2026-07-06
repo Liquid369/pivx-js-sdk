@@ -13,6 +13,13 @@
  * topic is a utf8 string, sequence is a little-endian u32, and the hash* bodies
  * are the 32-byte block/tx hash already in display order (hex it directly).
  *
+ * Reliability notes:
+ *  - Each topic carries its own sequence counter; a gap in `sequence` for a
+ *    topic means messages were dropped (high-water mark, reconnect) — re-sync
+ *    the missed range via RPC.
+ *  - SUB sockets have no liveness signal: a dead node just goes silent. Pair
+ *    the subscription with a periodic RPC poll if you must detect that.
+ *
  * Launch the node with matching endpoints, e.g.
  *   -zmqpubhashblock=tcp://127.0.0.1:28332 -zmqpubrawtx=tcp://127.0.0.1:28332
  */
@@ -34,18 +41,30 @@ function toHex(bytes: Uint8Array): string {
   return s;
 }
 
+/** A ZMQ frame could not be decoded (wrong part count, bad sequence length,
+ * short hash body, or unknown topic). Subclass of Error so callers can
+ * discriminate a parse failure from other errors; parity with the Rust SDK's
+ * `ZmqError` enum (the message carries the specific cause). */
+export class ZmqError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZmqError';
+  }
+}
+
 /**
  * Decode a raw 3-part ZMQ multipart message [topic, body, sequence] into a
- * typed event. Pure — no socket, no deps. Throws on a malformed frame (wrong
- * part count, bad sequence length, short hash body) or unknown topic.
+ * typed event. Pure — no socket, no deps. Throws {@link ZmqError} on a
+ * malformed frame (wrong part count, bad sequence length, short hash body) or
+ * unknown topic.
  */
 export function parseZmqFrame(frames: Uint8Array[]): ZmqEvent {
   if (frames.length !== 3) {
-    throw new Error(`ZMQ frame: expected 3 parts [topic, body, sequence], got ${frames.length}`);
+    throw new ZmqError(`ZMQ frame: expected 3 parts [topic, body, sequence], got ${frames.length}`);
   }
   const [topicBytes, body, seqBytes] = frames;
   if (seqBytes.length !== 4) {
-    throw new Error(`ZMQ frame: sequence must be 4 bytes, got ${seqBytes.length}`);
+    throw new ZmqError(`ZMQ frame: sequence must be 4 bytes, got ${seqBytes.length}`);
   }
   const topic = new TextDecoder().decode(topicBytes);
   const sequence = new DataView(seqBytes.buffer, seqBytes.byteOffset, seqBytes.byteLength).getUint32(0, true);
@@ -53,7 +72,7 @@ export function parseZmqFrame(frames: Uint8Array[]): ZmqEvent {
     case TOPIC_HASHBLOCK:
     case TOPIC_HASHTX:
       if (body.length !== 32) {
-        throw new Error(`ZMQ ${topic}: hash body must be 32 bytes, got ${body.length}`);
+        throw new ZmqError(`ZMQ ${topic}: hash body must be 32 bytes, got ${body.length}`);
       }
       return { topic, hash: toHex(body), sequence };
     case TOPIC_RAWBLOCK:
@@ -61,7 +80,7 @@ export function parseZmqFrame(frames: Uint8Array[]): ZmqEvent {
     case TOPIC_RAWTX:
       return { topic, tx: body, sequence };
     default:
-      throw new Error(`ZMQ frame: unknown topic '${topic}'`);
+      throw new ZmqError(`ZMQ frame: unknown topic '${topic}'`);
   }
 }
 
@@ -72,14 +91,28 @@ interface RawSubscriber extends AsyncIterable<Uint8Array[]> {
   close(): void;
 }
 
+const KNOWN_TOPICS: ReadonlySet<string> = new Set([
+  TOPIC_HASHBLOCK,
+  TOPIC_HASHTX,
+  TOPIC_RAWBLOCK,
+  TOPIC_RAWTX,
+]);
+
 /**
  * Convenience subscriber over the optional `zeromq` package. Yields typed
  * {@link ZmqEvent}s via async iteration; call {@link close} when done.
+ *
+ * Frames on topics this client does not know are skipped (ZMQ subscriptions
+ * are prefix matches, so a future node can publish new topics); a malformed
+ * frame on a known topic still throws, and the socket is closed whenever the
+ * iteration ends — normally, by break, or by error.
  *
  *   const sub = await ZmqSubscriber.connect('tcp://127.0.0.1:28332', ['hashblock']);
  *   for await (const ev of sub) handle(ev);
  */
 export class ZmqSubscriber implements AsyncIterable<ZmqEvent> {
+  private closed = false;
+
   private constructor(private readonly sock: RawSubscriber) {}
 
   static async connect(endpoint: string, topics: string[]): Promise<ZmqSubscriber> {
@@ -101,10 +134,24 @@ export class ZmqSubscriber implements AsyncIterable<ZmqEvent> {
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<ZmqEvent> {
-    for await (const frames of this.sock) yield parseZmqFrame(frames);
+    try {
+      for await (const frames of this.sock) {
+        // Unknown topic on a well-formed frame: tolerate it (prefix
+        // subscription) rather than killing the iterator permanently.
+        if (frames.length === 3 && !KNOWN_TOPICS.has(new TextDecoder().decode(frames[0]))) {
+          continue;
+        }
+        yield parseZmqFrame(frames);
+      }
+    } finally {
+      this.close();
+    }
   }
 
+  /** Close the underlying socket. Safe to call more than once. */
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.sock.close();
   }
 }

@@ -19,6 +19,8 @@ Node >= 20.19. ESM only.
 ```js
 import { PivxClient, ShieldWatcher } from 'pivx-rpc';
 
+// credentials go in the user/pass options (or PivxClient.fromCookie) —
+// never embedded in a URL (http://user:pass@host is not supported)
 const client = new PivxClient({ user: 'rpcuser', pass: 'rpcpass' });
 
 const height = await client.getBlockCount();

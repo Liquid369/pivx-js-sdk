@@ -1,4 +1,10 @@
-export { PivxWallet, NoSpendAuthorityError, ScanDivergedError } from './wallet.js';
+export {
+  PivxWallet,
+  NoSpendAuthorityError,
+  ScanDivergedError,
+  InsufficientFundsError,
+  WalletBusyError,
+} from './wallet.js';
 export {
   deriveKey,
   p2pkhAddress,

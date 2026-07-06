@@ -40,24 +40,44 @@ export interface ShieldRecipient {
 /** Decrypted view of a shielded transaction (`viewshieldtransaction`). */
 export interface ShieldTxView {
   txid: string;
-  fee: number;
+  /** PIV money STRING — the node emits FormatMoney output (e.g. "0.00010000"),
+   * not a JSON number. Prefer the integer `valueSat` fields for arithmetic. */
+  fee: string;
   spends: {
     spend: number;
     txidPrev: string;
     outputPrev: number;
     address: string;
-    value: number;
+    /** PIV amount, or the string "unknown" when the wallet cannot recover the
+     * note amount (`valueSat` is 0 in that case). */
+    value: number | 'unknown';
     valueSat: number;
   }[];
   outputs: {
     output: number;
     outgoing: boolean;
     address: string;
-    value: number;
+    /** PIV amount, or the string "unknown" when the wallet cannot recover the
+     * note amount (`valueSat` is 0 in that case). */
+    value: number | 'unknown';
     valueSat: number;
     memo: string;
     memoStr?: string;
   }[];
+}
+
+/** `getmasternodecount` result. When the node has no chain tip yet (fresh
+ * datadir, still syncing headers) pivxd returns the bare string "unknown"
+ * instead of this object; the client surfaces that as a thrown error. */
+export interface MasternodeCount {
+  total: number;
+  stable: number;
+  enabled: number;
+  inqueue: number;
+  ipv4: number;
+  ipv6: number;
+  onion: number;
+  [key: string]: unknown;
 }
 
 /** Source for `shieldsendmany`: an address, or one of the selector strings. */
