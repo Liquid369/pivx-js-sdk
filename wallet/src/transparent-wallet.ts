@@ -91,7 +91,7 @@ function ownedScriptHash(script: Uint8Array): string | undefined {
 }
 
 export class TransparentWallet {
-  private keys = new Map<string, Uint8Array>(); // hex hash160 → privkey
+  #keys = new Map<string, Uint8Array>(); // hex hash160 → privkey
   private external: { hash: string; address: string }[] = [];
   private change: string[] = [];
   private nextExternal = 0;
@@ -126,11 +126,11 @@ export class TransparentWallet {
       const ext = deriveKey(seed, network, account, 0, i);
       const eh = hex(hash160(ext.publicKey));
       w.external.push({ hash: eh, address: ext.address });
-      w.keys.set(eh, ext.privateKey);
+      w.#keys.set(eh, ext.privateKey);
       const ch = deriveKey(seed, network, account, 1, i);
       const chh = hex(hash160(ch.publicKey));
       w.change.push(chh);
-      w.keys.set(chh, ch.privateKey);
+      w.#keys.set(chh, ch.privateKey);
     }
     return w;
   }
@@ -194,7 +194,7 @@ export class TransparentWallet {
     if (!Number.isInteger(vout) || vout < 0 || vout > 0xffffffff) return false;
     if (!Number.isSafeInteger(amount) || amount < 0) return false;
     const h = ownedScriptHash(scriptPubKey);
-    if (h && this.keys.has(h)) {
+    if (h && this.#keys.has(h)) {
       this.utxos.set(`${txid}:${vout}`, { txid, vout, amount, scriptPubKey, keyHash: h, coinbase, height });
       return true;
     }
@@ -556,7 +556,7 @@ export class TransparentWallet {
       vout: u.vout,
       amount: u.amount,
       scriptPubKey: u.scriptPubKey,
-      privateKey: this.keys.get(u.keyHash)!,
+      privateKey: this.#keys.get(u.keyHash)!,
     }));
     const spent = selected.map((u) => ({ txid: u.txid, vout: u.vout }));
     const rawHex = buildTransparentTx(inputs, outputs, 0);
@@ -674,7 +674,7 @@ export class TransparentWallet {
       ) {
         throw new Error('wallet state contains a malformed utxo');
       }
-      if (!w.keys.has(u.keyHash)) {
+      if (!w.#keys.has(u.keyHash)) {
         throw new Error('wallet state does not match seed: utxo key hash is not derived from it');
       }
       const script = fromHex(u.scriptPubKey);

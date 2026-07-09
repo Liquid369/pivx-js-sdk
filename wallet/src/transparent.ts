@@ -120,12 +120,20 @@ export function deriveKey(
   const master = HDKey.fromMasterSeed(seed);
   const child = master.derive(`m/44'/${COIN_TYPE[network]}'/${account}'/${change}/${index}`);
   if (!child.privateKey || !child.publicKey) throw new Error('key derivation failed');
-  const wif = b58c.encode(Uint8Array.from([WIF_PREFIX[network], ...child.privateKey, 0x01]));
+  const privateKey = child.privateKey;
+  const publicKey = child.publicKey; // compressed
   return {
-    privateKey: child.privateKey,
-    publicKey: child.publicKey, // compressed
+    privateKey,
+    publicKey,
     network,
-    address: p2pkhAddress(child.publicKey, network),
-    wif,
+    address: p2pkhAddress(publicKey, network),
+    // WIF is base58check-encoded lazily, on read: TransparentWallet.create
+    // derives 2*gap keys (up to 20000) and never touches `.wif`, so eager
+    // encoding produced thousands of unused private-key strings on the heap.
+    // A getter preserves `.wif` property access; matches Rust's lazy
+    // TransparentKey::wif().
+    get wif(): string {
+      return b58c.encode(Uint8Array.from([WIF_PREFIX[network], ...privateKey, 0x01]));
+    },
   };
 }

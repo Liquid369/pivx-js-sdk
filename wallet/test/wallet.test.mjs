@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import util from 'node:util';
 import { PivxWallet, NoSpendAuthorityError, InvalidKeyError } from '../dist/index.js';
 import { EXTSK, SHIELD_ADDRESS, TX_HEX } from './fixtures.mjs';
 
@@ -191,4 +192,26 @@ test('handleBlocks rejects non-ascending heights', async () => {
       ]),
     /ascending/,
   );
+});
+
+// S3: extsk is an ES #private field, so it can never be reached by
+// console.log(wallet) / util.inspect / JSON.stringify — a TypeScript `private`
+// field is only compile-time and would leak the spending key at runtime.
+test('S3: spending key does not leak via JSON.stringify or util.inspect', async () => {
+  const wallet = await PivxWallet.create({
+    spendingKey: EXTSK,
+    network: 'testnet',
+    birthHeight: BIRTH,
+  });
+  assert.ok(wallet.canSpend, 'wallet must hold spend authority for this to be meaningful');
+  assert.ok(
+    !JSON.stringify(wallet).includes(EXTSK),
+    'spending key must not appear in JSON.stringify output',
+  );
+  assert.ok(
+    !util.inspect(wallet, { depth: null }).includes(EXTSK),
+    'spending key must not appear in util.inspect output',
+  );
+  // #extsk is not even an own property name.
+  assert.ok(!Object.getOwnPropertyNames(wallet).includes('extsk'));
 });

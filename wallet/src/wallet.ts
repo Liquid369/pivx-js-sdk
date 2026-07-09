@@ -209,7 +209,7 @@ const txMayBeAccepted = (err: RpcError): boolean =>
  * with {@link loadSpendingKey}.
  */
 export class PivxWallet {
-  private extsk?: string;
+  #extsk?: string;
   private notes: SpendableNote[] = [];
   private nullifierMap = new Map<string, { recipient: string; value: number }>();
   /** txid → nullifiers awaiting broadcast confirmation. Persisted, so a
@@ -230,7 +230,7 @@ export class PivxWallet {
     diversifierIndex: number[],
     extsk?: string,
   ) {
-    this.extsk = extsk;
+    this.#extsk = extsk;
     this.diversifierIndex = diversifierIndex;
   }
 
@@ -240,7 +240,7 @@ export class PivxWallet {
 
   /** True when the wallet holds spend authority. */
   get canSpend(): boolean {
-    return this.extsk !== undefined;
+    return this.#extsk !== undefined;
   }
 
   static async create(opts: CreateWalletOptions): Promise<PivxWallet> {
@@ -317,7 +317,7 @@ export class PivxWallet {
 
   /** Upgrade a watch-only wallet. The key must match the stored viewing key. */
   loadSpendingKey(spendingKey: string): void {
-    if (this.extsk) throw new InvalidKeyError('wallet already has a spending key');
+    if (this.#extsk) throw new InvalidKeyError('wallet already has a spending key');
     const derived = this.shield.generate_extended_full_viewing_key(
       spendingKey,
       this.isTestnet,
@@ -325,7 +325,7 @@ export class PivxWallet {
     if (derived !== this.extfvk) {
       throw new InvalidKeyError('spending key does not match this wallet\'s viewing key');
     }
-    this.extsk = spendingKey;
+    this.#extsk = spendingKey;
   }
 
   // ── Addresses & balance ───────────────────────────────────────────────────
@@ -791,7 +791,7 @@ export class PivxWallet {
    * {@link discardTransaction}.
    */
   async createTransaction(opts: CreateTransactionOptions): Promise<BuiltTransaction> {
-    if (!this.extsk) throw new NoSpendAuthorityError();
+    if (!this.#extsk) throw new NoSpendAuthorityError();
     if (!Number.isSafeInteger(opts.amount) || opts.amount <= 0) {
       throw new Error('amount must be a positive integer number of satoshis');
     }
@@ -864,7 +864,7 @@ export class PivxWallet {
         result = (await this.shield.create_transaction({
           notes: useShield ? spendable : null,
           utxos: useShield ? null : (opts.inputs as TransparentInput[]),
-          extsk: this.extsk,
+          extsk: this.#extsk,
           to_address: opts.to,
           change_address: changeAddress,
           amount: opts.amount,

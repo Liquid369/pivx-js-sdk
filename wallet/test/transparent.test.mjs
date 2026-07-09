@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { base58check } from '@scure/base';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { deriveKey, encodeAddress, decodeAddress, isValidAddress } from '../dist/index.js';
 
 // The derived address is cross-checked against the Rust SDK (same seed →
@@ -13,6 +15,26 @@ test('BIP44 derivation matches the Rust SDK and is deterministic', () => {
   assert.notEqual(deriveKey(seed, 'mainnet', 0, 0, 1).address, k.address);
   assert.match(k.address, /^D/);
   assert.ok(k.wif.length > 0 && k.privateKey.length === 32 && k.publicKey.length === 33);
+});
+
+// S7: WIF is computed lazily (a getter), not eagerly on every derivation —
+// TransparentWallet.create derives 2*gap keys (up to 20000) and never reads
+// .wif, so eager encoding produced thousands of unused private-key strings on
+// the heap. Matches Rust's lazy TransparentKey::wif(); a getter preserves the
+// public `.wif` property shape for any caller that reads it.
+test('S7: deriveKey computes wif lazily and still returns the correct value', () => {
+  const seed = new Uint8Array(32).fill(9);
+  const k = deriveKey(seed, 'mainnet', 0, 0, 0);
+  const desc = Object.getOwnPropertyDescriptor(k, 'wif');
+  assert.equal(typeof desc.get, 'function', 'wif must be an accessor (computed on read)');
+  assert.equal(desc.value, undefined, 'wif must not be an eagerly-materialized string');
+  // Correctness: reading .wif yields the compressed-WIF base58check encoding,
+  // recomputed here independently from the raw private key (mainnet prefix 0xD4).
+  const b58c = base58check(sha256);
+  const expected = b58c.encode(Uint8Array.from([212, ...k.privateKey, 0x01]));
+  assert.equal(k.wif, expected);
+  // Deterministic across reads and re-derivations.
+  assert.equal(k.wif, deriveKey(seed, 'mainnet', 0, 0, 0).wif);
 });
 
 // W-SEED reference lock (funds-critical): a 64-byte BIP39 seed derives the same

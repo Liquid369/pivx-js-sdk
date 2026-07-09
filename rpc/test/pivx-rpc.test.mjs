@@ -918,6 +918,28 @@ test('constructor rejects credentials embedded in the URL', () => {
   );
 });
 
+test('S2: constructor rejects credentials in a host option without leaking the password', () => {
+  // A `host` of "user:pass@…" composes a credentialed base URL. If the check
+  // only looked at opts.url, Node fetch would later throw with the password in
+  // the message and it would land in a TransportError. Reject at construction,
+  // synchronously, before any request — and never surface the password.
+  let thrown;
+  assert.throws(
+    () => new PivxClient({ host: 'user:s3cr3t-pass@10.0.0.5' }),
+    (err) => {
+      thrown = err;
+      return /credentials in the URL are not supported/.test(err.message);
+    },
+  );
+  assert.ok(!(thrown instanceof TransportError), 'must reject at construction, not as a transport error');
+  assert.ok(!thrown.message.includes('s3cr3t-pass'), 'the password must not appear in the thrown message');
+  // A credentialed host also combined with a wallet path is still rejected.
+  assert.throws(
+    () => new PivxClient({ host: 'user:pw@10.0.0.5', wallet: 'w' }),
+    /credentials in the URL are not supported/,
+  );
+});
+
 test('importSaplingKey with a rescan outlives the default request timeout', async () => {
   // The stub answers after 150ms; the client timeout is 50ms. Only the
   // import calls (rescan not "no") get the raised per-call timeout.

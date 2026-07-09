@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-09
+
+Security hardening from a full wallet security review (no Critical/High found;
+the fundamentals — deterministic RFC6979/low-S signing, no spend authority in
+persisted state — were verified sound, including a live-mainnet transaction).
+
+### Fixed
+
+- `pivx-rpc`: credentials embedded in the `host` option (e.g.
+  `{ host: 'user:pass@node' }`) are now rejected at construction like the `url`
+  option already was, so a password can no longer reach a thrown transport
+  error.
+- `pivx-wallet`: the extended spending key, the transparent key map, and the
+  RPC auth header are now ES `#private` fields — `console.log`/`JSON.stringify`
+  of a wallet or client no longer serialize the spending key (TypeScript
+  `private` is only a compile-time guard). `TransparentWallet`'s WIF is now a
+  lazy getter, so key derivation no longer materializes thousands of unused
+  private-key strings.
+
+### Security
+
+- Examples read the spending key from an environment variable instead of argv
+  (argv is exposed via shell history / process listing / CI logs).
+- The shield crypto WASM (`pivx-shield-rust`) is pinned to an exact version
+  rather than a compatible range.
+- SECURITY.md documents the trusted-node transparent-sighash caveat (a
+  malicious node can misreport an input amount; being addressed by v3
+  amount-committing signatures), the absence of in-memory secret scrubbing,
+  and WASM provenance.
+
 ## [0.7.1] - 2026-07-06
 
 Patch from a post-publish audit: `pivx-rpc` 0.7.1, `pivx-wallet` 0.7.1.

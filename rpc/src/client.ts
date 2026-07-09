@@ -108,34 +108,36 @@ let nextId = 0;
 
 export class PivxClient {
   private readonly url: string;
-  private authHeader?: string;
+  #authHeader?: string;
   /** Set when built via {@link fromCookie}; enables the 401 refresh-and-retry. */
   private cookiePath?: string;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
 
   constructor(opts: PivxClientOptions = {}) {
-    if (opts.url !== undefined) {
-      // fetch() rejects URLs carrying userinfo, so catch it early with a
-      // pointer to the supported mechanism (same contract as the Rust SDK).
-      let parsed: URL | undefined;
-      try {
-        parsed = new URL(opts.url);
-      } catch {
-        /* a malformed URL fails in fetch() with the method-labeled wrapper */
-      }
-      if (parsed && (parsed.username !== '' || parsed.password !== '')) {
-        throw new Error(
-          'credentials in the URL are not supported; use the user/pass options instead',
-        );
-      }
-    }
     const base = opts.url ?? `http://${opts.host ?? '127.0.0.1'}:${opts.port ?? 51473}`;
     this.url = opts.wallet
       ? `${base.replace(/\/$/, '')}/wallet/${encodeURIComponent(opts.wallet)}`
       : base;
+    // fetch() rejects URLs carrying userinfo, so catch it early with a pointer
+    // to the supported mechanism (same contract as the Rust SDK). Check the
+    // FINAL composed URL, not just opts.url: a `host` like "user:pass@10.0.0.5"
+    // composes a credentialed base too, and Node fetch would throw with the
+    // password in the message — landing in a TransportError. A malformed URL is
+    // left to fail in fetch() with the method-labeled wrapper.
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(this.url);
+    } catch {
+      /* a malformed URL fails in fetch() with the method-labeled wrapper */
+    }
+    if (parsed && (parsed.username !== '' || parsed.password !== '')) {
+      throw new Error(
+        'credentials in the URL are not supported; use the user/pass options instead',
+      );
+    }
     if (opts.user !== undefined) {
-      this.authHeader = PivxClient.basicAuth(opts.user, opts.pass ?? '');
+      this.#authHeader = PivxClient.basicAuth(opts.user, opts.pass ?? '');
     }
     this.timeoutMs = opts.timeoutMs ?? 30000;
     // Big enough for a full verbosity-2 block; blocks getblock spam only.
@@ -167,7 +169,7 @@ export class PivxClient {
   ): Promise<PivxClient> {
     const client = new PivxClient(opts);
     client.cookiePath = cookiePath;
-    client.authHeader = await PivxClient.readCookie(cookiePath);
+    client.#authHeader = await PivxClient.readCookie(cookiePath);
     return client;
   }
 
@@ -190,7 +192,7 @@ export class PivxClient {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          ...(this.authHeader ? { authorization: this.authHeader } : {}),
+          ...(this.#authHeader ? { authorization: this.#authHeader } : {}),
         },
         body,
         signal: AbortSignal.timeout(timeoutMs),
@@ -217,8 +219,8 @@ export class PivxClient {
     let res = await this.post(payload, label, timeoutMs);
     if (res.status === 401 && this.cookiePath) {
       const fresh = await PivxClient.readCookie(this.cookiePath).catch(() => undefined);
-      if (fresh !== undefined && fresh !== this.authHeader) {
-        this.authHeader = fresh;
+      if (fresh !== undefined && fresh !== this.#authHeader) {
+        this.#authHeader = fresh;
         await res.body?.cancel().catch(() => {});
         res = await this.post(payload, label, timeoutMs);
       }

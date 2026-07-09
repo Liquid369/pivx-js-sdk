@@ -14,6 +14,7 @@ import {
   hash160,
 } from '../dist/index.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
+import util from 'node:util';
 
 const toHex = (b) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
 
@@ -947,4 +948,28 @@ test('W4: EXM recipient is fee-sized at its true length; P2PKH unchanged', () =>
   const changeExm = changeAfter(true);
   const changeP2pkh = changeAfter(false);
   assert.equal(changeP2pkh - changeExm, 10);
+});
+
+// S3: the key map is an ES #private field, so console.log(wallet) /
+// util.inspect can no longer print the raw private keys (JSON.stringify never
+// showed a Map's contents, but util.inspect did). A TypeScript `private` field
+// is compile-time only and would still be dumped at runtime.
+test('S3: private keys do not leak via util.inspect or JSON.stringify', () => {
+  const seed = new Uint8Array(32).fill(7);
+  const w = TransparentWallet.create(seed, 'mainnet', 0, 4);
+  // The exact private key the wallet stores for external index 0.
+  const priv = deriveKey(seed, 'mainnet', 0, 0, 0).privateKey;
+  // util.inspect prints a Uint8Array as its bytes joined by ", "; breakLength
+  // Infinity keeps it on one line so a leak is a contiguous substring.
+  const bytes = [...priv].join(', ');
+  const inspected = util.inspect(w, { depth: null, breakLength: Infinity });
+  assert.ok(!inspected.includes(bytes), 'private key bytes must not appear in util.inspect output');
+  assert.ok(
+    !inspected.includes('Uint8Array'),
+    'a fresh wallet has no visible Uint8Array — the only ones are the hidden private keys',
+  );
+  assert.ok(!JSON.stringify(w).includes(bytes), 'private key bytes must not appear in JSON.stringify output');
+  // Sanity: the keys still work — this wallet can recognize and select its UTXO.
+  const a0 = deriveKey(seed, 'mainnet', 0, 0, 0);
+  assert.equal(w.addUtxo('bb'.repeat(32), 0, 1_000_000_000, scriptPubKeyForAddress(a0.address)), true);
 });
