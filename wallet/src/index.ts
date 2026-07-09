@@ -20,6 +20,7 @@ export {
 } from './transparent.js';
 export {
   buildTransparentTx,
+  transparentSighash,
   scriptPubKeyForAddress,
   type TxInput,
   type TxOutput,

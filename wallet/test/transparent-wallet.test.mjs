@@ -29,10 +29,27 @@ test('tracks own UTXOs, ignores others, selects and spends', () => {
   assert.equal(w.balance(), 200_000_000);
 
   const { hex, spent } = w.buildSend(other, 100_000_000, 100);
-  assert.match(hex, /^01000000/);
+  assert.match(hex, /^03000000/);
   assert.equal(spent.length, 1);
   w.markSpent(spent);
   assert.equal(w.balance(), 0);
+});
+
+// Cross-SDK byte-parity: this exact recipe (seed 0x07, testnet, one 1 PIV input
+// aa..:0 on the first receive address, send 0.9 PIV back to it, feePerByte 100)
+// must build the identical tx hex the Rust SDK pins as FIXTURE_TX_HEX
+// (transparent_wallet.rs `cross_sdk_v3_send_fixture`) — and that a regtest node
+// accepted. Locks the JS<->Rust v3 serialization + sighash + signature together.
+const FIXTURE_TX_HEX =
+  '0300000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000006a4730440220162490515f41b79479ba519e8c8fd325783dcbf138e44d8ac4f61a3b5a09065d02201e6011a5f20e9a162d6c92e036358e08950ec1f9bdd8f2d3ea7c0b48b4eeefab0121026ba36f35dfb3979ab7610e2839bd1f25c00df98bf9087f24d55488b485910f94ffffffff02804a5d05000000001976a9141d26a055949695e1753a1fd7cc747cb6218f5bd888acec209800000000001976a914b5d35b0e79d267ab599ce7917e9ff56179b6ba2688ac00000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+test('cross-SDK v3 fixture: buildSend hex identical to Rust build_send', () => {
+  const seed = new Uint8Array(32).fill(7);
+  const w = TransparentWallet.create(seed, 'testnet', 0, 20);
+  const a0 = deriveKey(seed, 'testnet', 0, 0, 0);
+  assert.equal(w.addUtxo('aa'.repeat(32), 0, 100_000_000, scriptPubKeyForAddress(a0.address)), true);
+  const { hex, spent } = w.buildSend(a0.address, 90_000_000, 100);
+  assert.equal(hex, FIXTURE_TX_HEX, 'JS v3 tx hex must equal Rust FIXTURE_TX_HEX');
+  assert.equal(spent.length, 1);
 });
 
 test('scanBlock credits our outputs and removes spends', () => {
@@ -202,7 +219,7 @@ test('recognizes, tracks, and spends 26-byte exchange (EXM) outputs', () => {
   assert.equal(w.balance(), 300_000_000);
 
   const { hex, spent } = w.buildSend(a0.address, 250_000_000, 100); // needs both EXM utxos
-  assert.match(hex, /^01000000/);
+  assert.match(hex, /^03000000/);
   assert.equal(spent.length, 2);
 });
 
@@ -274,7 +291,7 @@ test('save/load round-trip preserves cursors, scan position, utxos, and pending'
   assert.equal(cb.height, 100);
   // The loaded wallet can spend the non-reserved utxo.
   const r2 = w2.buildSend(a0.address, 100_000_000, 100);
-  assert.match(r2.hex, /^01000000/);
+  assert.match(r2.hex, /^03000000/);
   assert.deepEqual(r2.spent, [{ txid: 'bb'.repeat(32), vout: 2 }]);
   // Stable round-trip: load(save(x)).save() === save(x).
   assert.equal(TransparentWallet.load(seed, json).save(), json);
@@ -797,7 +814,7 @@ test('getUtxos returns copies, not live internals', () => {
   u.scriptPubKey.fill(0xff);
   assert.equal(w.balance(), 200_000_000); // untouched
   const { hex } = w.buildSend(a0.address, 100_000_000, 100); // script not corrupted
-  assert.match(hex, /^01000000/);
+  assert.match(hex, /^03000000/);
 });
 
 // C12: spendableBalance applies buildSend's maturity filter; balance
@@ -927,9 +944,12 @@ test('W2: load rejects out-of-range persisted heights', () => {
 // assumes. At 10 sat/byte an EXM send must pay 10 sats more fee (10 sats less
 // change) than a P2PKH send — before the fix both were counted at 34.
 test('W4: EXM recipient is fee-sized at its true length; P2PKH unchanged', () => {
-  // Change output is the last output: [8-byte value][0x19][25-byte script][4 locktime].
+  // v3 tail is [8-byte value][0x19][25-byte script][4 locktime][75-byte sapData];
+  // drop the trailing empty sapData (150 hex) before indexing the change output.
+  const body = (hex) => hex.slice(0, -150);
   const readChangeValue = (hex) => {
-    const valHex = hex.slice(hex.length - 76, hex.length - 60);
+    const b = body(hex);
+    const valHex = b.slice(b.length - 76, b.length - 60);
     let v = 0n;
     for (let i = 0; i < 8; i++) v += BigInt(parseInt(valHex.slice(i * 2, i * 2 + 2), 16)) << BigInt(8 * i);
     return Number(v);
@@ -942,7 +962,8 @@ test('W4: EXM recipient is fee-sized at its true length; P2PKH unchanged', () =>
     const hash = hash160(deriveKey(new Uint8Array(32).fill(9), 'mainnet', 0, 0, 0).publicKey);
     const to = encodeAddress(hash, 'mainnet', toExm ? 'exchange' : 'p2pkh');
     const { hex } = w.buildSend(to, 100_000_000, 10);
-    assert.equal(hex.slice(hex.length - 60, hex.length - 58), '19', 'change is a 25-byte P2PKH output');
+    const b = body(hex);
+    assert.equal(b.slice(b.length - 60, b.length - 58), '19', 'change is a 25-byte P2PKH output');
     return readChangeValue(hex);
   };
   const changeExm = changeAfter(true);

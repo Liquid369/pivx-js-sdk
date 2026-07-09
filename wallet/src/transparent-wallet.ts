@@ -467,8 +467,10 @@ export class TransparentWallet {
   }
 
   private static estSize(nIn: number, outBytes: number): number {
+    // 10 = nVersion+nType(4) + vin/vout count varints(2) + nLockTime(4);
+    // +75 = the empty-but-present v3 sapData block (transparent-tx.ts).
     // +2: the input-count varint grows from 1 to 3 bytes at 253 inputs.
-    return nIn * 148 + outBytes + 10 + (nIn >= 253 ? 2 : 0);
+    return nIn * 148 + outBytes + 85 + (nIn >= 253 ? 2 : 0);
   }
 
   /**
